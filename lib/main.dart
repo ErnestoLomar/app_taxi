@@ -6,6 +6,7 @@ import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:geolocator/geolocator.dart';
 
+import 'app_theme.dart';
 import 'fare_config.dart';
 import 'taximeter_controller.dart';
 import 'directions_service.dart';
@@ -36,18 +37,24 @@ class _MissingEnvApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
+      theme: AppTheme.light(),
       home: Scaffold(
         body: SafeArea(
           child: Padding(
-            padding: const EdgeInsets.all(16),
+            padding: const EdgeInsets.all(18),
             child: Center(
-              child: Text(
-                'Falta GOOGLE_WEB_KEY en .env\n\n'
-                    '1) Crea .env en la raíz\n'
-                    '2) Agrega GOOGLE_WEB_KEY=TU_KEY\n'
-                    '3) Declara .env en assets del pubspec.yaml\n',
-                textAlign: TextAlign.center,
-                style: const TextStyle(fontSize: 16),
+              child: Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Text(
+                    'Falta GOOGLE_WEB_KEY en .env\n\n'
+                        '1) Crea .env en la raíz\n'
+                        '2) Agrega GOOGLE_WEB_KEY=TU_KEY\n'
+                        '3) Declara .env en assets del pubspec.yaml\n',
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(fontSize: 15, height: 1.35),
+                  ),
+                ),
               ),
             ),
           ),
@@ -65,10 +72,7 @@ class TaxiApp extends StatelessWidget {
     return MaterialApp(
       title: 'Taxi SCT',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        useMaterial3: true,
-        colorSchemeSeed: Colors.green,
-      ),
+      theme: AppTheme.light(),
       home: const TaxiMapTaximeterPage(),
     );
   }
@@ -110,9 +114,10 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
 
   bool _locating = false;
   bool _loadingRoute = false;
-
-  // evita dobles toques y da feedback inmediato mientras arranca
   bool _startingTrip = false;
+
+  // Centro SLP para sesgar autocompletado
+  static const LatLng _slpCenter = LatLng(22.1565, -100.9855);
 
   @override
   void initState() {
@@ -137,12 +142,16 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
         if (mounted) setState(() {});
       });
 
-    // arrancar sin ruta planeada
     _taximeter.setPlannedRoute(const []);
 
-    // KEY desde .env
     _directions = DirectionsService(kGoogleWebKey);
-    _places = PlacesService(kGoogleWebKey);
+
+    // ✅ IMPORTANTE: asignar al campo, NO crear variable local
+    _places = PlacesService(
+      kGoogleWebKey,
+      restrictToSlp: true,
+      // slpRadiusMeters: 60000,
+    );
 
     _centerOnUserOnce();
   }
@@ -228,8 +237,12 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
     _lastFollowMove = now;
     _lastFollowTarget = target;
 
-    final bearing = _safeHeading(pos);
-    _animateFollowCamera(target, bearing);
+    _animateFollowCamera(target, _safeHeading(pos));
+  }
+
+  void _snack(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
   }
 
   Future<void> _goToMyLocation() async {
@@ -240,6 +253,7 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
       final serviceEnabled = await Geolocator.isLocationServiceEnabled();
       if (!serviceEnabled) {
         setState(() => _status = 'Activa el GPS para ubicarte.');
+        _snack('Activa el GPS para ubicarte.');
         return;
       }
 
@@ -247,6 +261,7 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
       if (perm == LocationPermission.denied) perm = await Geolocator.requestPermission();
       if (perm == LocationPermission.denied || perm == LocationPermission.deniedForever) {
         setState(() => _status = 'Permiso de ubicación no concedido.');
+        _snack('Permiso de ubicación no concedido.');
         return;
       }
 
@@ -262,15 +277,17 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
         desiredAccuracy: LocationAccuracy.high,
         timeLimit: const Duration(seconds: 6),
       );
-      final me = LatLng(pos.latitude, pos.longitude);
 
+      final me = LatLng(pos.latitude, pos.longitude);
       await _map?.animateCamera(
         CameraUpdate.newCameraPosition(CameraPosition(target: me, zoom: 17)),
       );
     } on TimeoutException {
-      setState(() => _status = 'Ubicación actual tardó; usando última conocida.');
+      setState(() => _status = 'Ubicación tardó; usando última conocida.');
+      _snack('Ubicación tardó; usando última conocida.');
     } catch (e) {
       setState(() => _status = 'Error obteniendo ubicación: $e');
+      _snack('Error obteniendo ubicación');
     } finally {
       if (mounted) setState(() => _locating = false);
     }
@@ -305,7 +322,7 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
 
   Future<void> _setOriginFromPlace(String desc, String placeId, String token) async {
     if (_locked) return;
-    final ll = await _places.placeIdToLatLng(placeId, sessionToken: token);
+    final ll = await _places.placeIdToLatLng(placeId, sessionToken: token, requireSlp: true);
     if (ll == null) {
       setState(() => _status = 'No se pudo obtener coordenadas del origen');
       return;
@@ -320,7 +337,7 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
 
   Future<void> _setDestFromPlace(String desc, String placeId, String token) async {
     if (_locked) return;
-    final ll = await _places.placeIdToLatLng(placeId, sessionToken: token);
+    final ll = await _places.placeIdToLatLng(placeId, sessionToken: token, requireSlp: true);
     if (ll == null) {
       setState(() => _status = 'No se pudo obtener coordenadas del destino');
       return;
@@ -430,6 +447,7 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
     } catch (e) {
       if (!mounted) return;
       setState(() => _status = 'Error: $e');
+      _snack('Error iniciando viaje');
     } finally {
       if (mounted) setState(() => _startingTrip = false);
     }
@@ -482,6 +500,7 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
 
   @override
   Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
     final kmLive = _taximeter.distanceMeters / 1000.0;
 
     final markers = <Marker>{
@@ -520,9 +539,25 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
 
     final estFare = _estimatedFare();
 
+    Widget fabSmall({
+      required String tag,
+      required VoidCallback? onPressed,
+      required Widget child,
+      bool active = true,
+    }) {
+      return FloatingActionButton.small(
+        heroTag: tag,
+        onPressed: onPressed,
+        backgroundColor: Colors.white,
+        foregroundColor: active ? scheme.primary : scheme.outline,
+        child: child,
+      );
+    }
+
     return Scaffold(
+      resizeToAvoidBottomInset: false, // ✅ evita que el body se encoja con el teclado
       appBar: AppBar(
-        title: const Text('Mapa + Taxímetro SCT'),
+        title: const Text('Taxi SCT'),
         actions: [
           IconButton(
             onPressed: _clearAll,
@@ -538,6 +573,9 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
             onMapCreated: (c) => _map = c,
             myLocationEnabled: true,
             myLocationButtonEnabled: false,
+            mapToolbarEnabled: false,
+            zoomControlsEnabled: false,
+            compassEnabled: false,
             onCameraMoveStarted: () {
               if (_isProgrammaticMove) return;
               if (_taximeter.running && _followCar) {
@@ -549,43 +587,50 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
             onTap: _onMapTap,
           ),
 
+          // Inputs arriba
           AnimatedOpacity(
-            duration: const Duration(milliseconds: 200),
+            duration: const Duration(milliseconds: 180),
             opacity: (_phase == RidePhase.inTrip) ? 0.0 : 1.0,
             child: IgnorePointer(
               ignoring: _phase == RidePhase.inTrip,
               child: Align(
                 alignment: Alignment.topCenter,
                 child: SafeArea(
-                  child: Container(
-                    margin: const EdgeInsets.all(12),
+                  child: Padding(
                     padding: const EdgeInsets.all(12),
-                    decoration: BoxDecoration(
-                      color: Colors.white.withOpacity(0.97),
-                      borderRadius: BorderRadius.circular(16),
-                      boxShadow: const [
-                        BoxShadow(blurRadius: 12, color: Colors.black12, offset: Offset(0, 6)),
-                      ],
-                    ),
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        PlaceAutocompleteField(
-                          label: 'Origen',
-                          places: _places,
-                          controller: _originCtl,
-                          enabled: !_locked,
-                          onSelected: (desc, placeId, token) => _setOriginFromPlace(desc, placeId, token),
+                    child: Card(
+                      color: Colors.white.withOpacity(0.96),
+                      child: Padding(
+                        padding: const EdgeInsets.all(12),
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            PlaceAutocompleteField(
+                              label: 'Origen (SLP)',
+                              places: _places,
+                              controller: _originCtl,
+                              enabled: !_locked,
+                              biasLat: _slpCenter.latitude,
+                              biasLng: _slpCenter.longitude,
+                              onSelected: (desc, placeId, token) {
+                                _setOriginFromPlace(desc, placeId, token);
+                              },
+                            ),
+                            const SizedBox(height: 10),
+                            PlaceAutocompleteField(
+                              label: 'Destino (SLP)',
+                              places: _places,
+                              controller: _destCtl,
+                              enabled: !_locked,
+                              biasLat: _slpCenter.latitude,
+                              biasLng: _slpCenter.longitude,
+                              onSelected: (desc, placeId, token) {
+                                _setDestFromPlace(desc, placeId, token);
+                              },
+                            ),
+                          ],
                         ),
-                        const SizedBox(height: 10),
-                        PlaceAutocompleteField(
-                          label: 'Destino',
-                          places: _places,
-                          controller: _destCtl,
-                          enabled: !_locked,
-                          onSelected: (desc, placeId, token) => _setDestFromPlace(desc, placeId, token),
-                        ),
-                      ],
+                      ),
                     ),
                   ),
                 ),
@@ -593,41 +638,42 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
             ),
           ),
 
+          // FABs derecha
           Positioned(
-            right: 16,
+            right: 14,
             bottom: 300,
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                FloatingActionButton.small(
-                  heroTag: 'btn_fit_route',
+                fabSmall(
+                  tag: 'btn_fit_route',
                   onPressed: (_route != null && _route!.polyline.isNotEmpty)
                       ? () => _fitBounds(_route!.polyline)
                       : null,
                   child: const Icon(Icons.center_focus_strong),
                 ),
                 const SizedBox(height: 10),
-
-                FloatingActionButton.small(
-                  heroTag: 'btn_follow',
+                fabSmall(
+                  tag: 'btn_follow',
                   onPressed: _taximeter.running
                       ? () {
                     setState(() => _followCar = true);
                     _maybeFollowCar(force: true);
                   }
                       : null,
+                  active: _taximeter.running,
                   child: Icon(_followCar ? Icons.navigation : Icons.navigation_outlined),
                 ),
                 const SizedBox(height: 10),
-
-                FloatingActionButton.small(
-                  heroTag: 'btn_my_location',
+                fabSmall(
+                  tag: 'btn_my_location',
                   onPressed: _locating ? null : _goToMyLocation,
+                  active: !_locating,
                   child: _locating
                       ? const SizedBox(
                     width: 18,
                     height: 18,
-                    child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                    child: CircularProgressIndicator(strokeWidth: 2),
                   )
                       : const Icon(Icons.my_location),
                 ),
@@ -635,187 +681,171 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
             ),
           ),
 
+          // Bottom sheet
           DraggableScrollableSheet(
             initialChildSize: (_phase == RidePhase.inTrip) ? 0.30 : 0.26,
             minChildSize: (_phase == RidePhase.inTrip) ? 0.22 : 0.20,
             maxChildSize: 0.58,
             builder: (context, controller) {
-              return Container(
-                decoration: BoxDecoration(
-                  color: Colors.white.withOpacity(0.97),
+              return Material(
+                color: Colors.transparent,
+                child: ClipRRect(
                   borderRadius: const BorderRadius.vertical(top: Radius.circular(22)),
-                  boxShadow: const [
-                    BoxShadow(blurRadius: 18, color: Colors.black26, offset: Offset(0, -2)),
-                  ],
-                ),
-                child: ListView(
-                  controller: controller,
-                  padding: const EdgeInsets.fromLTRB(14, 10, 14, 14),
-                  children: [
-                    Center(
-                      child: Container(
-                        width: 42,
-                        height: 5,
-                        decoration: BoxDecoration(
-                          color: Colors.black12,
-                          borderRadius: BorderRadius.circular(10),
-                        ),
-                      ),
+                  child: Container(
+                    decoration: BoxDecoration(
+                      color: Colors.white.withOpacity(0.97),
+                      border: Border(top: BorderSide(color: scheme.outlineVariant)),
                     ),
-                    const SizedBox(height: 10),
-
-                    Text(_status, style: const TextStyle(fontSize: 13), textAlign: TextAlign.center),
-                    const SizedBox(height: 10),
-
-                    Row(
+                    child: ListView(
+                      controller: controller,
+                      padding: const EdgeInsets.fromLTRB(14, 10, 14, 14),
                       children: [
-                        Expanded(
-                          child: DropdownButtonFormField<Shift>(
-                            value: _taximeter.shift,
-                            items: const [
-                              DropdownMenuItem(value: Shift.diurno, child: Text('Diurno')),
-                              DropdownMenuItem(value: Shift.nocturno, child: Text('Nocturno')),
+                        Center(
+                          child: Container(
+                            width: 42,
+                            height: 5,
+                            decoration: BoxDecoration(
+                              color: Colors.black12,
+                              borderRadius: BorderRadius.circular(10),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 10),
+
+                        Text(
+                          _status,
+                          style: TextStyle(fontSize: 13, color: scheme.onSurface.withOpacity(0.75)),
+                          textAlign: TextAlign.center,
+                        ),
+                        const SizedBox(height: 10),
+
+                        Row(
+                          children: [
+                            Expanded(
+                              child: DropdownButtonFormField<Shift>(
+                                value: _taximeter.shift,
+                                items: const [
+                                  DropdownMenuItem(value: Shift.diurno, child: Text('Diurno')),
+                                  DropdownMenuItem(value: Shift.nocturno, child: Text('Nocturno')),
+                                ],
+                                onChanged: _locked ? null : (v) => v != null ? _taximeter.setShift(v) : null,
+                                decoration: const InputDecoration(labelText: 'Turno'),
+                              ),
+                            ),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: DropdownButtonFormField<ServiceChannel>(
+                                value: _taximeter.channel,
+                                items: const [
+                                  DropdownMenuItem(value: ServiceChannel.calle, child: Text('Calle')),
+                                  DropdownMenuItem(value: ServiceChannel.telefonico, child: Text('Telefónico')),
+                                  DropdownMenuItem(value: ServiceChannel.app, child: Text('App')),
+                                ],
+                                onChanged: _locked ? null : (v) => v != null ? _taximeter.setChannel(v) : null,
+                                decoration: const InputDecoration(labelText: 'Solicitud'),
+                              ),
+                            ),
+                          ],
+                        ),
+
+                        const SizedBox(height: 12),
+
+                        if (_phase == RidePhase.routeReady && _route != null)
+                          _SummaryCard(
+                            title: 'Resumen del viaje',
+                            rows: [
+                              _SummaryRow('Distancia', '${_route!.distanceKm.toStringAsFixed(2)} km'),
+                              _SummaryRow('Tiempo aprox.', _formatEta(_route!.duration)),
+                              _SummaryRow(
+                                'Tarifa estimada',
+                                estFare == null ? '-' : '\$${estFare.toStringAsFixed(2)}',
+                              ),
                             ],
-                            onChanged: _locked ? null : (v) => v != null ? _taximeter.setShift(v) : null,
-                            decoration: const InputDecoration(
-                              labelText: 'Turno',
-                              border: OutlineInputBorder(),
-                              isDense: true,
-                            ),
                           ),
-                        ),
-                        const SizedBox(width: 10),
-                        Expanded(
-                          child: DropdownButtonFormField<ServiceChannel>(
-                            value: _taximeter.channel,
-                            items: const [
-                              DropdownMenuItem(value: ServiceChannel.calle, child: Text('Calle')),
-                              DropdownMenuItem(value: ServiceChannel.telefonico, child: Text('Telefónico')),
-                              DropdownMenuItem(value: ServiceChannel.app, child: Text('App')),
+
+                        if (_phase == RidePhase.inTrip)
+                          _SummaryCard(
+                            title: 'En viaje',
+                            rows: [
+                              _SummaryRow('Tarifa', '\$${_taximeter.fare.toStringAsFixed(2)}', big: true),
+                              _SummaryRow('Tiempo', _formatDuration(_taximeter.elapsed)),
+                              _SummaryRow('Distancia', '${kmLive.toStringAsFixed(2)} km'),
+                              _SummaryRow('Unidades', '${_taximeter.units}'),
                             ],
-                            onChanged: _locked ? null : (v) => v != null ? _taximeter.setChannel(v) : null,
-                            decoration: const InputDecoration(
-                              labelText: 'Solicitud',
-                              border: OutlineInputBorder(),
-                              isDense: true,
-                            ),
                           ),
+
+                        if (_phase == RidePhase.finished)
+                          _SummaryCard(
+                            title: 'Viaje finalizado',
+                            rows: [
+                              _SummaryRow('Tarifa final', '\$${_taximeter.fare.toStringAsFixed(2)}', big: true),
+                              _SummaryRow('Tiempo', _formatDuration(_taximeter.elapsed)),
+                              _SummaryRow('Distancia', '${kmLive.toStringAsFixed(2)} km'),
+                              _SummaryRow('Unidades', '${_taximeter.units}'),
+                            ],
+                          ),
+
+                        const SizedBox(height: 12),
+
+                        Row(
+                          children: [
+                            Expanded(
+                              child: OutlinedButton.icon(
+                                onPressed: (_origin != null && _destination != null && !_locked && !_loadingRoute)
+                                    ? _calculateRoute
+                                    : null,
+                                icon: _loadingRoute
+                                    ? const SizedBox(
+                                  width: 16,
+                                  height: 16,
+                                  child: CircularProgressIndicator(strokeWidth: 2),
+                                )
+                                    : const Icon(Icons.alt_route),
+                                label: const Text('Calcular ruta'),
+                              ),
+                            ),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: FilledButton.icon(
+                                onPressed: () async {
+                                  if (_startingTrip) return;
+
+                                  if (_phase == RidePhase.routeReady) {
+                                    await _startTrip();
+                                  } else if (_phase == RidePhase.inTrip) {
+                                    await _stopTrip();
+                                  } else if (_phase == RidePhase.finished) {
+                                    _clearAll();
+                                  }
+                                },
+                                icon: _startingTrip
+                                    ? const SizedBox(
+                                  width: 16,
+                                  height: 16,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                    color: Colors.white,
+                                  ),
+                                )
+                                    : Icon(
+                                  _phase == RidePhase.inTrip
+                                      ? Icons.stop
+                                      : (_phase == RidePhase.finished ? Icons.refresh : Icons.play_arrow),
+                                ),
+                                label: Text(
+                                  _startingTrip
+                                      ? 'Iniciando...'
+                                      : (_phase == RidePhase.inTrip
+                                      ? 'Detener'
+                                      : (_phase == RidePhase.finished ? 'Nuevo viaje' : 'Iniciar viaje')),
+                                ),
+                              ),
+                            ),
+                          ],
                         ),
                       ],
                     ),
-
-                    const SizedBox(height: 12),
-
-                    if (_phase == RidePhase.routeReady && _route != null)
-                      _SummaryCard(
-                        title: 'Resumen del viaje',
-                        rows: [
-                          _SummaryRow('Distancia', '${_route!.distanceKm.toStringAsFixed(2)} km'),
-                          _SummaryRow('Tiempo aprox.', _formatEta(_route!.duration)),
-                          _SummaryRow('Tarifa estimada', estFare == null ? '-' : '\$${estFare.toStringAsFixed(2)}'),
-                        ],
-                      ),
-
-                    if (_phase == RidePhase.inTrip)
-                      _SummaryCard(
-                        title: 'En viaje',
-                        rows: [
-                          _SummaryRow('Tarifa', '\$${_taximeter.fare.toStringAsFixed(2)}', big: true),
-                          _SummaryRow('Tiempo', _formatDuration(_taximeter.elapsed)),
-                          _SummaryRow('Distancia', '${kmLive.toStringAsFixed(2)} km'),
-                          _SummaryRow('Unidades', '${_taximeter.units}'),
-                        ],
-                      ),
-
-                    if (_phase == RidePhase.finished)
-                      _SummaryCard(
-                        title: 'Viaje finalizado',
-                        rows: [
-                          _SummaryRow('Tarifa final', '\$${_taximeter.fare.toStringAsFixed(2)}', big: true),
-                          _SummaryRow('Tiempo', _formatDuration(_taximeter.elapsed)),
-                          _SummaryRow('Distancia', '${kmLive.toStringAsFixed(2)} km'),
-                          _SummaryRow('Unidades', '${_taximeter.units}'),
-                        ],
-                      ),
-
-                    const SizedBox(height: 12),
-
-                    Row(
-                      children: [
-                        Expanded(
-                          child: ElevatedButton.icon(
-                            onPressed: (_origin != null && _destination != null && !_locked && !_loadingRoute)
-                                ? _calculateRoute
-                                : null,
-                            icon: _loadingRoute
-                                ? const SizedBox(
-                              width: 16,
-                              height: 16,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            )
-                                : const Icon(Icons.alt_route),
-                            label: const Text('Calcular ruta'),
-                          ),
-                        ),
-                        const SizedBox(width: 10),
-                        Expanded(
-                          child: FilledButton.icon(
-                            onPressed: () async {
-                              if (_startingTrip) return;
-
-                              if (_phase == RidePhase.routeReady) {
-                                await _startTrip();
-                              } else if (_phase == RidePhase.inTrip) {
-                                await _stopTrip();
-                              } else if (_phase == RidePhase.finished) {
-                                _clearAll();
-                              }
-                            },
-                            icon: _startingTrip
-                                ? const SizedBox(
-                              width: 16,
-                              height: 16,
-                              child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
-                            )
-                                : Icon(
-                              _phase == RidePhase.inTrip
-                                  ? Icons.stop
-                                  : (_phase == RidePhase.finished ? Icons.refresh : Icons.play_arrow),
-                            ),
-                            label: Text(
-                              _startingTrip
-                                  ? 'Iniciando...'
-                                  : (_phase == RidePhase.inTrip
-                                  ? 'Detener'
-                                  : (_phase == RidePhase.finished ? 'Nuevo viaje' : 'Iniciar viaje')),
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-
-                    const SizedBox(height: 10),
-
-                    Row(
-                      children: [
-                        Expanded(
-                          child: OutlinedButton.icon(
-                            onPressed: (_phase == RidePhase.inTrip) ? () {} : null,
-                            icon: const Icon(Icons.shield_outlined),
-                            label: const Text('Seguridad'),
-                          ),
-                        ),
-                        const SizedBox(width: 10),
-                        Expanded(
-                          child: OutlinedButton.icon(
-                            onPressed: (_phase == RidePhase.inTrip) ? () {} : null,
-                            icon: const Icon(Icons.share_outlined),
-                            label: const Text('Compartir'),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ],
+                  ),
                 ),
               );
             },
@@ -845,35 +875,35 @@ class _SummaryCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(
-        color: Colors.black.withOpacity(0.03),
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: Colors.black12),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(title, style: const TextStyle(fontWeight: FontWeight.w800)),
-          const SizedBox(height: 10),
-          for (final r in rows) ...[
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                Text(r.label, style: const TextStyle(color: Colors.black54)),
-                Text(
-                  r.value,
-                  style: TextStyle(
-                    fontWeight: r.big ? FontWeight.w900 : FontWeight.w700,
-                    fontSize: r.big ? 20 : 14,
+    final scheme = Theme.of(context).colorScheme;
+
+    return Card(
+      color: scheme.surfaceContainerHighest.withOpacity(0.55),
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(title, style: const TextStyle(fontWeight: FontWeight.w800)),
+            const SizedBox(height: 10),
+            for (final r in rows) ...[
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text(r.label, style: TextStyle(color: scheme.onSurface.withOpacity(0.65))),
+                  Text(
+                    r.value,
+                    style: TextStyle(
+                      fontWeight: r.big ? FontWeight.w900 : FontWeight.w700,
+                      fontSize: r.big ? 20 : 14,
+                    ),
                   ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 8),
+                ],
+              ),
+              const SizedBox(height: 8),
+            ],
           ],
-        ],
+        ),
       ),
     );
   }
