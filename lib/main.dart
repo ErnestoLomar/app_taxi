@@ -303,9 +303,9 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
     });
   }
 
-  Future<void> _setOriginFromPlace(String desc, String placeId) async {
+  Future<void> _setOriginFromPlace(String desc, String placeId, String token) async {
     if (_locked) return;
-    final ll = await _places.placeIdToLatLng(placeId);
+    final ll = await _places.placeIdToLatLng(placeId, sessionToken: token);
     if (ll == null) {
       setState(() => _status = 'No se pudo obtener coordenadas del origen');
       return;
@@ -318,9 +318,9 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
     await _map?.animateCamera(CameraUpdate.newLatLngZoom(ll, 15));
   }
 
-  Future<void> _setDestFromPlace(String desc, String placeId) async {
+  Future<void> _setDestFromPlace(String desc, String placeId, String token) async {
     if (_locked) return;
-    final ll = await _places.placeIdToLatLng(placeId);
+    final ll = await _places.placeIdToLatLng(placeId, sessionToken: token);
     if (ll == null) {
       setState(() => _status = 'No se pudo obtener coordenadas del destino');
       return;
@@ -575,7 +575,7 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
                           places: _places,
                           controller: _originCtl,
                           enabled: !_locked,
-                          onSelected: (desc, placeId) => _setOriginFromPlace(desc, placeId),
+                          onSelected: (desc, placeId, token) => _setOriginFromPlace(desc, placeId, token),
                         ),
                         const SizedBox(height: 10),
                         PlaceAutocompleteField(
@@ -583,7 +583,7 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
                           places: _places,
                           controller: _destCtl,
                           enabled: !_locked,
-                          onSelected: (desc, placeId) => _setDestFromPlace(desc, placeId),
+                          onSelected: (desc, placeId, token) => _setDestFromPlace(desc, placeId, token),
                         ),
                       ],
                     ),

@@ -18,7 +18,7 @@ class PlacesService {
 
   PlacesService(this.apiKey);
 
-  String _sessionToken() {
+  String newSessionToken() {
     final r = Random();
     return '${DateTime.now().millisecondsSinceEpoch}-${r.nextInt(1 << 32)}';
   }
@@ -27,11 +27,15 @@ class PlacesService {
       String input, {
         LatLng? locationBias,
         int radiusMeters = 30000,
+        String? sessionToken,
+        int maxResults = 6,
       }) async {
     final q = input.trim();
     if (q.length < 3) return [];
 
-    final token = _sessionToken();
+    final token = (sessionToken == null || sessionToken.trim().isEmpty)
+        ? newSessionToken()
+        : sessionToken.trim();
 
     final params = <String, String>{
       'input': q,
@@ -39,9 +43,10 @@ class PlacesService {
       'language': 'es',
       'components': 'country:mx',
       'sessiontoken': token,
+      // Mejora relevancia (menos reintentos):
+      'types': 'geocode', // puedes probar 'address' si te funciona mejor
     };
 
-    // Opcional: sesgar resultados hacia SLP (mejor UX)
     if (locationBias != null) {
       params['location'] = '${locationBias.latitude},${locationBias.longitude}';
       params['radius'] = radiusMeters.toString();
@@ -57,23 +62,32 @@ class PlacesService {
 
     final body = json.decode(res.body) as Map<String, dynamic>;
     final status = (body['status'] ?? '').toString();
+
     if (status != 'OK' && status != 'ZERO_RESULTS') {
       final msg = (body['error_message'] ?? '').toString();
       throw Exception('Places Autocomplete $status ${msg.isEmpty ? "" : "- $msg"}');
     }
 
     final preds = (body['predictions'] as List<dynamic>? ?? []);
-    return preds.map((p) {
+    final items = preds.map((p) {
       final m = p as Map<String, dynamic>;
       return PlacePrediction(
         placeId: (m['place_id'] ?? '').toString(),
         description: (m['description'] ?? '').toString(),
       );
     }).where((p) => p.placeId.isNotEmpty && p.description.isNotEmpty).toList();
+
+    if (items.length <= maxResults) return items;
+    return items.take(maxResults).toList();
   }
 
-  Future<LatLng?> placeIdToLatLng(String placeId) async {
-    final token = _sessionToken();
+  Future<LatLng?> placeIdToLatLng(
+      String placeId, {
+        String? sessionToken,
+      }) async {
+    final token = (sessionToken == null || sessionToken.trim().isEmpty)
+        ? newSessionToken()
+        : sessionToken.trim();
 
     final uri = Uri.https('maps.googleapis.com', '/maps/api/place/details/json', {
       'place_id': placeId,
@@ -90,6 +104,7 @@ class PlacesService {
 
     final body = json.decode(res.body) as Map<String, dynamic>;
     final status = (body['status'] ?? '').toString();
+
     if (status != 'OK') {
       final msg = (body['error_message'] ?? '').toString();
       throw Exception('Place Details $status ${msg.isEmpty ? "" : "- $msg"}');

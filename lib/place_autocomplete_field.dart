@@ -7,10 +7,12 @@ class PlaceAutocompleteField extends StatefulWidget {
   final String label;
   final PlacesService places;
   final TextEditingController controller;
-  final void Function(String description, String placeId) onSelected;
+
+  /// NUEVO: incluye sessionToken
+  final void Function(String description, String placeId, String sessionToken) onSelected;
+
   final bool enabled;
 
-  // Opcional: sesgo por ubicación
   final double? biasLat;
   final double? biasLng;
 
@@ -34,21 +36,41 @@ class _PlaceAutocompleteFieldState extends State<PlaceAutocompleteField> {
   List<PlacePrediction> _items = [];
   bool _loading = false;
 
+  String? _sessionToken;
+  String _lastQuery = '';
+
   @override
   void dispose() {
     _debounce?.cancel();
     super.dispose();
   }
 
+  void _ensureSession() {
+    _sessionToken ??= widget.places.newSessionToken();
+  }
+
+  void _resetSession() {
+    _sessionToken = null;
+  }
+
   void _onChanged(String text) {
+    if (!widget.enabled) return;
+
+    final q = text.trim();
+    if (q == _lastQuery) return;
+    _lastQuery = q;
+
     _debounce?.cancel();
-    _debounce = Timer(const Duration(milliseconds: 350), () async {
+    _debounce = Timer(const Duration(milliseconds: 550), () async {
       if (!mounted) return;
 
-      if (text.trim().length < 3) {
+      if (q.length < 3) {
         setState(() => _items = []);
+        _resetSession();
         return;
       }
+
+      _ensureSession();
 
       setState(() => _loading = true);
       try {
@@ -57,9 +79,11 @@ class _PlaceAutocompleteFieldState extends State<PlaceAutocompleteField> {
             : null;
 
         final results = await widget.places.autocomplete(
-          text,
+          q,
           locationBias: bias,
           radiusMeters: 35000,
+          sessionToken: _sessionToken,
+          maxResults: 6,
         );
 
         if (!mounted) return;
@@ -71,10 +95,17 @@ class _PlaceAutocompleteFieldState extends State<PlaceAutocompleteField> {
   }
 
   void _selectItem(PlacePrediction p) {
+    final token = _sessionToken ?? widget.places.newSessionToken();
+
     widget.controller.text = p.description;
     setState(() => _items = []);
-    widget.onSelected(p.description, p.placeId);
+
+    widget.onSelected(p.description, p.placeId, token);
+
     FocusScope.of(context).unfocus();
+
+    // Termina la sesión tras seleccionar (ya se usará token en Place Details)
+    _resetSession();
   }
 
   @override
@@ -102,6 +133,8 @@ class _PlaceAutocompleteFieldState extends State<PlaceAutocompleteField> {
                   ? () {
                 widget.controller.clear();
                 setState(() => _items = []);
+                _lastQuery = '';
+                _resetSession();
               }
                   : null,
             )),
@@ -114,7 +147,7 @@ class _PlaceAutocompleteFieldState extends State<PlaceAutocompleteField> {
             decoration: BoxDecoration(
               color: Colors.white,
               border: Border.all(color: Colors.black12),
-              borderRadius: BorderRadius.circular(10),
+              borderRadius: BorderRadius.circular(12),
               boxShadow: const [BoxShadow(blurRadius: 10, color: Colors.black12, offset: Offset(0, 6))],
             ),
             constraints: const BoxConstraints(maxHeight: 220),
