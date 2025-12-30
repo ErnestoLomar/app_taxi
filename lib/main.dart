@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:math';
+
 import 'package:flutter/material.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:geolocator/geolocator.dart';
 
@@ -11,12 +13,49 @@ import 'places_service.dart';
 import 'place_autocomplete_field.dart';
 import 'route_info.dart';
 
-const String kGoogleWebKey = String.fromEnvironment(
-  'GOOGLE_WEB_KEY',
-  defaultValue: 'AIzaSyDsBqBIY7s5BaPkExRPaiO0IDd2m4P-ahA',
-);
+late final String kGoogleWebKey;
 
-void main() => runApp(const TaxiApp());
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await dotenv.load(fileName: '.env');
+
+  kGoogleWebKey = (dotenv.env['GOOGLE_WEB_KEY'] ?? '').trim();
+
+  if (kGoogleWebKey.isEmpty) {
+    runApp(const _MissingEnvApp());
+    return;
+  }
+
+  runApp(const TaxiApp());
+}
+
+class _MissingEnvApp extends StatelessWidget {
+  const _MissingEnvApp();
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      home: Scaffold(
+        body: SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Center(
+              child: Text(
+                'Falta GOOGLE_WEB_KEY en .env\n\n'
+                    '1) Crea .env en la raíz\n'
+                    '2) Agrega GOOGLE_WEB_KEY=TU_KEY\n'
+                    '3) Declara .env en assets del pubspec.yaml\n',
+                textAlign: TextAlign.center,
+                style: const TextStyle(fontSize: 16),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
 
 class TaxiApp extends StatelessWidget {
   const TaxiApp({super.key});
@@ -47,8 +86,8 @@ class TaxiMapTaximeterPage extends StatefulWidget {
 class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
   GoogleMapController? _map;
 
-  bool _followCar = true;               // seguimiento activo/inactivo
-  bool _isProgrammaticMove = false;     // para distinguir mov. usuario vs animateCamera
+  bool _followCar = true;
+  bool _isProgrammaticMove = false;
   DateTime _lastFollowMove = DateTime.fromMillisecondsSinceEpoch(0);
   LatLng? _lastFollowTarget;
 
@@ -71,6 +110,9 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
 
   bool _locating = false;
   bool _loadingRoute = false;
+
+  // evita dobles toques y da feedback inmediato mientras arranca
+  bool _startingTrip = false;
 
   @override
   void initState() {
@@ -95,6 +137,10 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
         if (mounted) setState(() {});
       });
 
+    // arrancar sin ruta planeada
+    _taximeter.setPlannedRoute(const []);
+
+    // KEY desde .env
     _directions = DirectionsService(kGoogleWebKey);
     _places = PlacesService(kGoogleWebKey);
 
@@ -109,7 +155,7 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
     super.dispose();
   }
 
-  bool get _locked => _taximeter.running || _phase == RidePhase.inTrip;
+  bool get _locked => _taximeter.running || _phase == RidePhase.inTrip || _startingTrip;
 
   Future<void> _centerOnUserOnce() async {
     try {
@@ -122,7 +168,7 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
       final pos = await Geolocator.getCurrentPosition(desiredAccuracy: LocationAccuracy.high);
       _initialCenter = LatLng(pos.latitude, pos.longitude);
       await _map?.animateCamera(CameraUpdate.newLatLngZoom(_initialCenter, 15));
-      setState(() {});
+      if (mounted) setState(() {});
     } catch (_) {}
   }
 
@@ -149,7 +195,6 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
         ),
       );
     } finally {
-      // pequeño delay para no confundir onCameraMoveStarted
       Future.delayed(const Duration(milliseconds: 600), () {
         _isProgrammaticMove = false;
       });
@@ -158,7 +203,7 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
 
   void _maybeFollowCar({bool force = false}) {
     if (!_followCar) return;
-    if (!_taximeter.running) return;     // solo durante viaje
+    if (!_taximeter.running) return;
     if (_map == null) return;
 
     final pos = _taximeter.currentPosition;
@@ -166,12 +211,10 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
 
     final now = DateTime.now();
 
-    // throttle: máx. 1 vez cada ~900ms
     if (!force && now.difference(_lastFollowMove).inMilliseconds < 900) return;
 
     final target = LatLng(pos.latitude, pos.longitude);
 
-    // evita “re-animar” si casi no cambió la posición
     if (!force && _lastFollowTarget != null) {
       final d = Geolocator.distanceBetween(
         _lastFollowTarget!.latitude,
@@ -179,14 +222,13 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
         target.latitude,
         target.longitude,
       );
-      if (d < 8) return; // < 8m no mueve cámara
+      if (d < 8) return;
     }
 
     _lastFollowMove = now;
     _lastFollowTarget = target;
 
     final bearing = _safeHeading(pos);
-    // no await aquí (para no bloquear el listener)
     _animateFollowCamera(target, bearing);
   }
 
@@ -236,6 +278,7 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
 
   void _resetRouteState() {
     _route = null;
+    _taximeter.setPlannedRoute(const []);
     if (_phase != RidePhase.inTrip) _phase = RidePhase.idle;
   }
 
@@ -301,6 +344,12 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
     try {
       final r = await _directions.fetchRoute(origin: _origin!, destination: _destination!);
 
+      if (r.polyline.isNotEmpty) {
+        _taximeter.setPlannedRoute(r.polyline);
+      } else {
+        _taximeter.setPlannedRoute(const []);
+      }
+
       setState(() {
         _route = r;
         if (r.polyline.isEmpty) {
@@ -314,6 +363,7 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
 
       if (r.polyline.isNotEmpty) await _fitBounds(r.polyline);
     } catch (e) {
+      _taximeter.setPlannedRoute(const []);
       setState(() {
         _status = 'Error calculando ruta: $e';
         _phase = RidePhase.idle;
@@ -348,7 +398,6 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
     final r = _route;
     if (r == null || r.distanceMeters <= 0 || r.durationSeconds <= 0) return null;
 
-    // Estimación usando tu mismo tabulador/ticks (no el taxímetro “en vivo”)
     return _cfg.fareFromTotals(
       shift: _taximeter.shift,
       channel: _taximeter.channel,
@@ -359,23 +408,37 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
 
   Future<void> _startTrip() async {
     if (_route == null || _route!.polyline.isEmpty) return;
-    if (_taximeter.running) return;
+    if (_taximeter.running || _startingTrip) return;
+
+    setState(() {
+      _startingTrip = true;
+      _status = 'Iniciando viaje...';
+    });
+
+    _taximeter.setPlannedRoute(_route!.polyline);
 
     try {
       await _taximeter.start();
+
+      if (!mounted) return;
       setState(() {
         _phase = RidePhase.inTrip;
         _status = 'Viaje en curso (taxímetro SCT activo)';
-        _maybeFollowCar(force: true);
+        _followCar = true;
       });
+      _maybeFollowCar(force: true);
     } catch (e) {
+      if (!mounted) return;
       setState(() => _status = 'Error: $e');
+    } finally {
+      if (mounted) setState(() => _startingTrip = false);
     }
   }
 
   Future<void> _stopTrip() async {
     if (!_taximeter.running) return;
     await _taximeter.stop();
+    if (!mounted) return;
     setState(() {
       _phase = RidePhase.finished;
       _status = 'Viaje finalizado';
@@ -383,7 +446,9 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
   }
 
   void _clearAll() {
-    if (_taximeter.running) return;
+    if (_taximeter.running || _startingTrip) return;
+
+    _taximeter.setPlannedRoute(const []);
 
     setState(() {
       _origin = null;
@@ -484,7 +549,6 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
             onTap: _onMapTap,
           ),
 
-          // Top card (se oculta en viaje para verse más “Uber”)
           AnimatedOpacity(
             duration: const Duration(milliseconds: 200),
             opacity: (_phase == RidePhase.inTrip) ? 0.0 : 1.0,
@@ -529,10 +593,9 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
             ),
           ),
 
-          // Floating buttons (derecha)
           Positioned(
             right: 16,
-            bottom: 300, // ajusta si quieres subir/bajar el grupo completo
+            bottom: 300,
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
@@ -572,7 +635,6 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
             ),
           ),
 
-          // Bottom sheet “Uber-like”
           DraggableScrollableSheet(
             initialChildSize: (_phase == RidePhase.inTrip) ? 0.30 : 0.26,
             minChildSize: (_phase == RidePhase.inTrip) ? 0.22 : 0.20,
@@ -605,7 +667,6 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
                     Text(_status, style: const TextStyle(fontSize: 13), textAlign: TextAlign.center),
                     const SizedBox(height: 10),
 
-                    // Selectores (bloqueados durante viaje)
                     Row(
                       children: [
                         Expanded(
@@ -645,21 +706,16 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
 
                     const SizedBox(height: 12),
 
-                    // Resumen de ruta (cuando está lista)
                     if (_phase == RidePhase.routeReady && _route != null)
                       _SummaryCard(
                         title: 'Resumen del viaje',
                         rows: [
                           _SummaryRow('Distancia', '${_route!.distanceKm.toStringAsFixed(2)} km'),
                           _SummaryRow('Tiempo aprox.', _formatEta(_route!.duration)),
-                          _SummaryRow(
-                            'Tarifa estimada',
-                            estFare == null ? '-' : '\$${estFare.toStringAsFixed(2)}',
-                          ),
+                          _SummaryRow('Tarifa estimada', estFare == null ? '-' : '\$${estFare.toStringAsFixed(2)}'),
                         ],
                       ),
 
-                    // Métricas en vivo (cuando está en viaje)
                     if (_phase == RidePhase.inTrip)
                       _SummaryCard(
                         title: 'En viaje',
@@ -671,7 +727,6 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
                         ],
                       ),
 
-                    // Resumen final
                     if (_phase == RidePhase.finished)
                       _SummaryCard(
                         title: 'Viaje finalizado',
@@ -685,7 +740,6 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
 
                     const SizedBox(height: 12),
 
-                    // Botones principales
                     Row(
                       children: [
                         Expanded(
@@ -707,6 +761,8 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
                         Expanded(
                           child: FilledButton.icon(
                             onPressed: () async {
+                              if (_startingTrip) return;
+
                               if (_phase == RidePhase.routeReady) {
                                 await _startTrip();
                               } else if (_phase == RidePhase.inTrip) {
@@ -715,15 +771,23 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
                                 _clearAll();
                               }
                             },
-                            icon: Icon(
+                            icon: _startingTrip
+                                ? const SizedBox(
+                              width: 16,
+                              height: 16,
+                              child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                            )
+                                : Icon(
                               _phase == RidePhase.inTrip
                                   ? Icons.stop
                                   : (_phase == RidePhase.finished ? Icons.refresh : Icons.play_arrow),
                             ),
                             label: Text(
-                              _phase == RidePhase.inTrip
+                              _startingTrip
+                                  ? 'Iniciando...'
+                                  : (_phase == RidePhase.inTrip
                                   ? 'Detener'
-                                  : (_phase == RidePhase.finished ? 'Nuevo viaje' : 'Iniciar viaje'),
+                                  : (_phase == RidePhase.finished ? 'Nuevo viaje' : 'Iniciar viaje')),
                             ),
                           ),
                         ),
@@ -732,7 +796,6 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
 
                     const SizedBox(height: 10),
 
-                    // Acciones “tipo Uber” (stubs sin backend)
                     Row(
                       children: [
                         Expanded(
@@ -775,6 +838,7 @@ class _SummaryCard extends StatelessWidget {
   final List<_SummaryRow> rows;
 
   const _SummaryCard({
+    super.key,
     required this.title,
     required this.rows,
   });

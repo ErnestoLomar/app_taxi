@@ -12,6 +12,7 @@ coverage/
 .metadata
 
 *.log
+.env
 
 ############################
 # FVM
