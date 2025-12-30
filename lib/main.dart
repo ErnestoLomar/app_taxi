@@ -91,6 +91,14 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
   GoogleMapController? _map;
 
   // -------------------------
+  // Auto-cálculo de ruta (debounce / dedupe / rate-limit)
+  // -------------------------
+  Timer? _autoRouteDebounce;
+  LatLng? _lastRouteOrigin;
+  LatLng? _lastRouteDest;
+  DateTime _lastRouteCalcAt = DateTime.fromMillisecondsSinceEpoch(0);
+
+  // -------------------------
   // Rerouting (recalcular ruta)
   // -------------------------
   bool _rerouting = false;
@@ -181,6 +189,7 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
 
   @override
   void dispose() {
+    _autoRouteDebounce?.cancel();
     _rerouteTimer?.cancel();
     _originCtl.dispose();
     _destCtl.dispose();
@@ -324,6 +333,40 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
     if (_phase != RidePhase.inTrip) _phase = RidePhase.idle;
   }
 
+  void _scheduleAutoRoute() {
+    if (_origin == null || _destination == null) return;
+    if (_locked || _loadingRoute || _rerouting) return;
+
+    // Si ya hay ruta y O/D no cambiaron (≈8m), no recalcular
+    final sameO = _lastRouteOrigin != null &&
+        Geolocator.distanceBetween(
+          _lastRouteOrigin!.latitude,
+          _lastRouteOrigin!.longitude,
+          _origin!.latitude,
+          _origin!.longitude,
+        ) <
+            8;
+
+    final sameD = _lastRouteDest != null &&
+        Geolocator.distanceBetween(
+          _lastRouteDest!.latitude,
+          _lastRouteDest!.longitude,
+          _destination!.latitude,
+          _destination!.longitude,
+        ) <
+            8;
+
+    if (_route != null && _route!.polyline.length >= 2 && sameO && sameD) return;
+
+    // Rate-limit extra (además del debounce)
+    if (DateTime.now().difference(_lastRouteCalcAt).inMilliseconds < 2000) return;
+
+    _autoRouteDebounce?.cancel();
+    _autoRouteDebounce = Timer(const Duration(milliseconds: 600), () {
+      _calculateRoute(auto: true);
+    });
+  }
+
   void _onMapTap(LatLng p) {
     if (_locked) return;
 
@@ -335,53 +378,68 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
       } else if (_destination == null) {
         _destination = p;
         _destCtl.text = 'Punto seleccionado';
-        _status = 'Destino listo. Pulsa "Calcular ruta"';
+        _status = 'Calculando ruta...';
       } else {
         _destination = p;
         _destCtl.text = 'Punto seleccionado';
-        _status = 'Destino actualizado. Pulsa "Calcular ruta"';
+        _status = 'Calculando ruta...';
       }
       _resetRouteState();
     });
+
+    _scheduleAutoRoute();
   }
 
   Future<void> _setOriginFromPlace(String desc, String placeId, String token) async {
     if (_locked) return;
+
     final ll = await _places.placeIdToLatLng(placeId, sessionToken: token, requireSlp: true);
     if (ll == null) {
       setState(() => _status = 'No se pudo obtener coordenadas del origen');
       return;
     }
+
     setState(() {
       _origin = ll;
-      _status = 'Origen listo. Selecciona destino';
       _resetRouteState();
+      _status = (_destination != null) ? 'Calculando ruta...' : 'Origen listo. Selecciona destino';
     });
+
     await _map?.animateCamera(CameraUpdate.newLatLngZoom(ll, 15));
+    _scheduleAutoRoute();
   }
 
   Future<void> _setDestFromPlace(String desc, String placeId, String token) async {
     if (_locked) return;
+
     final ll = await _places.placeIdToLatLng(placeId, sessionToken: token, requireSlp: true);
     if (ll == null) {
       setState(() => _status = 'No se pudo obtener coordenadas del destino');
       return;
     }
+
     setState(() {
       _destination = ll;
-      _status = 'Destino listo. Pulsa "Calcular ruta"';
       _resetRouteState();
+      _status = (_origin != null) ? 'Calculando ruta...' : 'Destino listo. Selecciona origen';
     });
+
     await _map?.animateCamera(CameraUpdate.newLatLngZoom(ll, 15));
+    _scheduleAutoRoute();
   }
 
-  Future<void> _calculateRoute() async {
+  Future<void> _calculateRoute({bool auto = false}) async {
     if (_origin == null || _destination == null || _locked) return;
 
     setState(() {
       _loadingRoute = true;
       _status = 'Calculando ruta...';
     });
+
+    // Dedupe para evitar recalcular lo mismo (costo)
+    _lastRouteOrigin = _origin;
+    _lastRouteDest = _destination;
+    _lastRouteCalcAt = DateTime.now();
 
     try {
       final r = await _directions.fetchRoute(origin: _origin!, destination: _destination!);
@@ -399,7 +457,7 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
           _status = 'Sin ruta (ZERO_RESULTS).';
         } else {
           _phase = RidePhase.routeReady;
-          _status = 'Ruta lista. Revisa resumen y presiona "Iniciar viaje".';
+          _status = 'Ruta lista. Presiona "Iniciar viaje".';
         }
       });
 
@@ -497,6 +555,11 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
 
   void _clearAll() {
     if (_taximeter.running || _startingTrip) return;
+
+    _autoRouteDebounce?.cancel();
+    _lastRouteOrigin = null;
+    _lastRouteDest = null;
+    _lastRouteCalcAt = DateTime.fromMillisecondsSinceEpoch(0);
 
     _taximeter.setPlannedRoute(const []);
     _taximeter.resetTripTrace();
@@ -601,6 +664,11 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
         _offRouteHits = 0;
         _lastRerouteAt = DateTime.now();
         _distanceAtLastReroute = _taximeter.distanceMeters;
+
+        // Actualiza dedupe para no auto-recalcular de nuevo por debounce
+        _lastRouteOrigin = from;
+        _lastRouteDest = _destination;
+        _lastRouteCalcAt = DateTime.now();
       } else {
         setState(() => _status = 'No se encontró ruta alternativa');
       }
@@ -918,61 +986,47 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
 
                         const SizedBox(height: 12),
 
-                        Row(
-                          children: [
-                            Expanded(
-                              child: OutlinedButton.icon(
-                                onPressed: (_origin != null && _destination != null && !_locked && !_loadingRoute)
-                                    ? _calculateRoute
-                                    : null,
-                                icon: _loadingRoute
-                                    ? const SizedBox(
-                                  width: 16,
-                                  height: 16,
-                                  child: CircularProgressIndicator(strokeWidth: 2),
-                                )
-                                    : const Icon(Icons.alt_route),
-                                label: const Text('Calcular ruta'),
-                              ),
-                            ),
-                            const SizedBox(width: 10),
-                            Expanded(
-                              child: FilledButton.icon(
-                                onPressed: () async {
-                                  if (_startingTrip) return;
+                        // ✅ Ya no hay botón "Calcular ruta".
+                        // La ruta se calcula automáticamente al tener origen + destino.
+                        SizedBox(
+                          width: double.infinity,
+                          child: FilledButton.icon(
+                            onPressed: () async {
+                              if (_startingTrip) return;
 
-                                  if (_phase == RidePhase.routeReady) {
-                                    await _startTrip();
-                                  } else if (_phase == RidePhase.inTrip) {
-                                    await _stopTrip();
-                                  } else if (_phase == RidePhase.finished) {
-                                    _clearAll();
-                                  }
-                                },
-                                icon: _startingTrip
-                                    ? const SizedBox(
-                                  width: 16,
-                                  height: 16,
-                                  child: CircularProgressIndicator(
-                                    strokeWidth: 2,
-                                    color: Colors.white,
-                                  ),
-                                )
-                                    : Icon(
-                                  _phase == RidePhase.inTrip
-                                      ? Icons.stop
-                                      : (_phase == RidePhase.finished ? Icons.refresh : Icons.play_arrow),
-                                ),
-                                label: Text(
-                                  _startingTrip
-                                      ? 'Iniciando...'
-                                      : (_phase == RidePhase.inTrip
-                                      ? 'Detener'
-                                      : (_phase == RidePhase.finished ? 'Nuevo viaje' : 'Iniciar viaje')),
-                                ),
+                              if (_phase == RidePhase.routeReady) {
+                                await _startTrip();
+                              } else if (_phase == RidePhase.inTrip) {
+                                await _stopTrip();
+                              } else if (_phase == RidePhase.finished) {
+                                _clearAll();
+                              } else {
+                                // idle: aún no hay ruta lista; se calcula sola al poner origen+destino
+                                // (no hacemos nada)
+                              }
+                            },
+                            icon: _startingTrip
+                                ? const SizedBox(
+                              width: 16,
+                              height: 16,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: Colors.white,
                               ),
+                            )
+                                : Icon(
+                              _phase == RidePhase.inTrip
+                                  ? Icons.stop
+                                  : (_phase == RidePhase.finished ? Icons.refresh : Icons.play_arrow),
                             ),
-                          ],
+                            label: Text(
+                              _startingTrip
+                                  ? 'Iniciando...'
+                                  : (_phase == RidePhase.inTrip
+                                  ? 'Detener'
+                                  : (_phase == RidePhase.finished ? 'Nuevo viaje' : 'Iniciar viaje')),
+                            ),
+                          ),
                         ),
                       ],
                     ),
