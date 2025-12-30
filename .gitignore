@@ -1,0 +1,74 @@
+############################
+# Flutter / Dart
+############################
+.dart_tool/
+.packages
+.pub/
+build/
+coverage/
+
+.flutter-plugins
+.flutter-plugins-dependencies
+.metadata
+
+*.log
+
+############################
+# FVM
+############################
+# Ignora el SDK que descarga FVM (no se versiona)
+.fvm/flutter_sdk/
+
+# Mantén el archivo de config para fijar la versión de Flutter
+!.fvm/fvm_config.json
+!.fvmrc
+
+############################
+# IDEs
+############################
+.idea/
+*.iml
+
+.vscode/
+*.code-workspace
+
+.DS_Store
+Thumbs.db
+
+############################
+# Android / Gradle
+############################
+android/.gradle/
+android/local.properties
+**/key.properties
+
+*.jks
+*.keystore
+
+############################
+# iOS / macOS (Xcode / CocoaPods)
+############################
+ios/Pods/
+ios/.symlinks/
+ios/Flutter/ephemeral/
+ios/Runner.xcworkspace/
+
+macos/Pods/
+macos/Flutter/ephemeral/
+
+DerivedData/
+*.xcuserstate
+*.xcuserdata/
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+*.moved-aside
+*.xccheckout
+*.xcscmblueprint
+
+############################
+# Desktop ephemeral
+############################
+linux/flutter/ephemeral/
+windows/flutter/ephemeral/
