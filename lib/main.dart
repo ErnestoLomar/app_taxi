@@ -90,6 +90,18 @@ class TaxiMapTaximeterPage extends StatefulWidget {
 class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
   GoogleMapController? _map;
 
+  // -------------------------
+// Rerouting (recalcular ruta)
+// -------------------------
+  bool _rerouting = false;
+  DateTime _lastRerouteAt = DateTime.fromMillisecondsSinceEpoch(0);
+
+  DateTime? _offRouteSince;
+  int _offRouteHits = 0;
+
+  DateTime _lastOffRouteCheckAt = DateTime.fromMillisecondsSinceEpoch(0);
+
+
   bool _followCar = true;
   bool _isProgrammaticMove = false;
   DateTime _lastFollowMove = DateTime.fromMillisecondsSinceEpoch(0);
@@ -139,6 +151,7 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
     _taximeter = TaximeterController(_cfg)
       ..addListener(() {
         _maybeFollowCar();
+        _maybeRerouteIfOffRoute(); // ✅ nuevo
         if (mounted) setState(() {});
       });
 
@@ -154,6 +167,147 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
     );
 
     _centerOnUserOnce();
+  }
+
+  double _distancePointToPolylineMeters(LatLng p, List<LatLng> line) {
+    if (line.length < 2) return double.infinity;
+
+    // Equirectangular projection para velocidad (suficiente a escala ciudad)
+    const double R = 6371000.0;
+    final double lat0 = p.latitude * (pi / 180.0);
+    final double cosLat = cos(lat0);
+
+    double toX(double lng) => (lng * (pi / 180.0)) * R * cosLat;
+    double toY(double lat) => (lat * (pi / 180.0)) * R;
+
+    final double px = toX(p.longitude);
+    final double py = toY(p.latitude);
+
+    double best = double.infinity;
+
+    for (int i = 0; i < line.length - 1; i++) {
+      final a = line[i];
+      final b = line[i + 1];
+
+      final ax = toX(a.longitude);
+      final ay = toY(a.latitude);
+      final bx = toX(b.longitude);
+      final by = toY(b.latitude);
+
+      final abx = bx - ax;
+      final aby = by - ay;
+
+      final apx = px - ax;
+      final apy = py - ay;
+
+      final abLen2 = abx * abx + aby * aby;
+      if (abLen2 == 0) continue;
+
+      double t = (apx * abx + apy * aby) / abLen2;
+      if (t < 0) t = 0;
+      if (t > 1) t = 1;
+
+      final cx = ax + abx * t;
+      final cy = ay + aby * t;
+
+      final dx = px - cx;
+      final dy = py - cy;
+
+      final d = sqrt(dx * dx + dy * dy);
+      if (d < best) best = d;
+    }
+
+    return best;
+  }
+
+  Future<void> _maybeRerouteIfOffRoute() async {
+    // Solo durante viaje
+    if (!_taximeter.running) return;
+    if (_destination == null) return;
+    if (_route == null || _route!.polyline.length < 2) return;
+    if (_rerouting) return;
+
+    final pos = _taximeter.currentPosition;
+    if (pos == null) return;
+
+    // No checar demasiado seguido (reduce CPU y “ruido”)
+    final now = DateTime.now();
+    if (now.difference(_lastOffRouteCheckAt).inMilliseconds < 900) return;
+    _lastOffRouteCheckAt = now;
+
+    final current = LatLng(pos.latitude, pos.longitude);
+
+    // Distancia a la ruta azul
+    final distToRoute = _distancePointToPolylineMeters(current, _route!.polyline);
+
+    // Umbral dinámico:
+    // - mínimo 30m (para no reroutear por pequeñas curvas/offset)
+    // - si accuracy es mala, sube el umbral
+    final acc = (pos.accuracy.isFinite ? pos.accuracy : 25.0);
+    final threshold = max(30.0, acc * 1.4); // ajustable
+
+    // Requiere persistencia: varias lecturas consecutivas
+    const int hitsNeeded = 3;           // 3 checks (~3s)
+    const int secondsNeeded = 8;        // o 8s seguidos
+    const int cooldownSeconds = 45;     // no recalcular más seguido que esto
+
+    if (distToRoute > threshold) {
+      _offRouteSince ??= now;
+      _offRouteHits++;
+
+      final offSeconds = now.difference(_offRouteSince!).inSeconds;
+      final canRerouteByHits = _offRouteHits >= hitsNeeded;
+      final canRerouteByTime = offSeconds >= secondsNeeded;
+
+      final cooldownOk = now.difference(_lastRerouteAt).inSeconds >= cooldownSeconds;
+
+      if ((canRerouteByHits || canRerouteByTime) && cooldownOk) {
+        await _doReroute(from: current);
+      }
+    } else {
+      // Volvió cerca de la ruta: resetea
+      _offRouteSince = null;
+      _offRouteHits = 0;
+    }
+  }
+
+  Future<void> _doReroute({required LatLng from}) async {
+    if (_destination == null) return;
+
+    _rerouting = true;
+    setState(() => _status = 'Recalculando ruta...');
+
+    try {
+      // OJO: esto consume Directions/Routes (costo real).
+      final r = await _directions.fetchRoute(
+        origin: from,
+        destination: _destination!,
+        // si tu DirectionsService tiene forceRefresh, puedes usarlo
+        // forceRefresh: true,
+      );
+
+      if (r.polyline.length >= 2) {
+        // Actualiza ruta azul
+        setState(() {
+          _route = r;
+          _status = 'Ruta actualizada';
+        });
+
+        // Importantísimo: actualiza la ruta planeada para tu map-matching local
+        _taximeter.setPlannedRoute(r.polyline);
+
+        // Reinicia el detector de off-route (si no, puede reroutear en cascada)
+        _offRouteSince = null;
+        _offRouteHits = 0;
+        _lastRerouteAt = DateTime.now();
+      } else {
+        setState(() => _status = 'No se encontró ruta alternativa');
+      }
+    } catch (e) {
+      setState(() => _status = 'Error al recalcular ruta: $e');
+    } finally {
+      _rerouting = false;
+    }
   }
 
   @override
