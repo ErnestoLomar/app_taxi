@@ -86,6 +86,18 @@ class TaximeterController extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Limpia SOLO el trazo del viaje (línea naranja) y contadores,
+  /// para poder iniciar otro viaje sin que se quede dibujado el anterior.
+  /// No detiene/inicia GPS (eso lo hace start/stop).
+  void resetTripTrace() {
+    distanceMeters = 0;
+    traveledPath.clear();
+    _window.clear();
+    _lastAccepted = null;
+    notifyListeners();
+  }
+
+
   TaximeterController(
       this.config, {
         this.shift = Shift.diurno,

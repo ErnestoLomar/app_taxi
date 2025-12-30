@@ -432,6 +432,9 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
       _status = 'Iniciando viaje...';
     });
 
+    // ✅ Limpia el viaje anterior (línea naranja + contadores) ANTES de iniciar uno nuevo
+    _taximeter.resetTripTrace();
+
     _taximeter.setPlannedRoute(_route!.polyline);
 
     try {
@@ -467,6 +470,9 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
     if (_taximeter.running || _startingTrip) return;
 
     _taximeter.setPlannedRoute(const []);
+
+    // ✅ Borra la línea naranja si el usuario limpia la pantalla
+    _taximeter.resetTripTrace();
 
     setState(() {
       _origin = null;
