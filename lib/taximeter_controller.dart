@@ -81,6 +81,12 @@ class TaximeterController extends ChangeNotifier {
   static const double _absoluteMaxJumpMeters = 0.0;
 
   // ------------------------
+  // UI optimization: thinning
+  // ------------------------
+  static const double _uiMinSegmentMeters = 6.0; // no dibujar micro-segmentos
+  static const int _uiMaxPoints = 2500; // cap opcional para viajes muy largos
+
+  // ------------------------
   // SNAP a ruta (map matching local)
   // ------------------------
 
@@ -203,7 +209,6 @@ class TaximeterController extends ChangeNotifier {
 
   double _snapRadiusMeters(double accuracyMeters) {
     // Menor radio = menos “pegado” a calles paralelas y mejor detección de desviación.
-    // Ajuste recomendado: 12..40m aprox.
     return max(12.0, min(40.0, accuracyMeters * 1.6));
   }
 
@@ -234,7 +239,6 @@ class TaximeterController extends ChangeNotifier {
     final latRad = _deg2rad(p.latitude);
     final cosLat = cos(latRad);
 
-    // Ventana alrededor del cursor para evitar pegarse a calles paralelas lejanas
     final n = _plannedRoute.length;
     int start = 0;
     int end = n - 2;
@@ -247,7 +251,6 @@ class TaximeterController extends ChangeNotifier {
     Offset bestXY = Offset.zero;
     int bestIdx = start;
 
-    // p es el origen (0,0)
     for (int i = start; i <= end; i++) {
       final a = _plannedRoute[i];
       final b = _plannedRoute[i + 1];
@@ -260,7 +263,6 @@ class TaximeterController extends ChangeNotifier {
       final denom = vx * vx + vy * vy;
       if (denom < 1e-6) continue;
 
-      // Punto más cercano del segmento al origen
       final t = (-axy.dx * vx - axy.dy * vy) / denom;
       final tc = t.clamp(0.0, 1.0);
 
@@ -310,7 +312,6 @@ class TaximeterController extends ChangeNotifier {
 
     running = true;
 
-    // Reinicia viaje (sin tocar la ruta azul)
     distanceMeters = 0;
     traveledPath.clear();
     _window.clear();
@@ -319,7 +320,6 @@ class TaximeterController extends ChangeNotifier {
     _distanceToPlannedRouteMeters = null;
     _snappedLast = false;
 
-    // reinicia cursor si hay ruta planeada
     _routeCursor = (_plannedRoute.length >= 2) ? 0 : -1;
 
     _stopwatch
@@ -327,23 +327,19 @@ class TaximeterController extends ChangeNotifier {
       ..start();
     _startTicker();
 
-    // Semilla rápida (no suma distancia)
     try {
       final last = await Geolocator.getLastKnownPosition();
       if (last != null) _seedFromPosition(last);
     } catch (_) {}
 
-    // Stream rápido al inicio
     await _startLocationStream(distanceFilter: 0);
 
-    // Luego cambia a un filtro más “económico” (menos eventos => menos CPU/batería)
     _switchToNormalFilterTimer?.cancel();
     _switchToNormalFilterTimer = Timer(const Duration(seconds: 12), () async {
       if (!running) return;
       await _startLocationStream(distanceFilter: 5);
     });
 
-    // Fuerza un fix fresco con timeout corto (sin bloquear inicio)
     Geolocator.getCurrentPosition(
       desiredAccuracy: LocationAccuracy.high,
       timeLimit: const Duration(seconds: 3),
@@ -389,6 +385,30 @@ class TaximeterController extends ChangeNotifier {
     notifyListeners();
   }
 
+  void _addTraveledPointForUi(LatLng ll) {
+    if (traveledPath.isEmpty) {
+      traveledPath.add(ll);
+      return;
+    }
+
+    final last = traveledPath.last;
+    final dUi = Geolocator.distanceBetween(
+      last.latitude,
+      last.longitude,
+      ll.latitude,
+      ll.longitude,
+    );
+
+    if (dUi >= _uiMinSegmentMeters) {
+      traveledPath.add(ll);
+
+      // cap opcional (evita listas gigantes)
+      if (traveledPath.length > _uiMaxPoints) {
+        traveledPath.removeRange(0, traveledPath.length - _uiMaxPoints);
+      }
+    }
+  }
+
   void _ingestPosition(Position pos) {
     if (!running) return;
 
@@ -406,7 +426,6 @@ class TaximeterController extends ChangeNotifier {
       time: now,
     );
 
-    // Mediana
     _window.add(raw);
     if (_window.length > _medianWindowSize) _window.removeAt(0);
     final filtered = (_window.length >= 3) ? _medianSample(_window) : raw;
@@ -414,7 +433,6 @@ class TaximeterController extends ChangeNotifier {
     final pFiltered = LatLng(filtered.lat, filtered.lng);
     _rawLatLng = pFiltered;
 
-    // Closest point a la ruta (para UI + reroute)
     final cand = _closestPointOnPlannedRoute(pFiltered);
     _distanceToPlannedRouteMeters = cand?.distMeters;
 
@@ -425,7 +443,6 @@ class TaximeterController extends ChangeNotifier {
     _snappedLast = canSnap;
     if (canSnap) _routeCursor = cand.segIndex;
 
-    // UI: posición para cámara/marker
     currentPosition = Position(
       latitude: useLatLng.latitude,
       longitude: useLatLng.longitude,
@@ -443,9 +460,8 @@ class TaximeterController extends ChangeNotifier {
 
     final last = _lastAccepted;
 
-    // Primer punto aceptado (no suma distancia)
     if (last == null) {
-      traveledPath.add(useLatLng);
+      _addTraveledPointForUi(useLatLng);
       _lastAccepted = _GpsSample(
         lat: useLatLng.latitude,
         lng: useLatLng.longitude,
@@ -468,22 +484,20 @@ class TaximeterController extends ChangeNotifier {
       useLatLng.longitude,
     );
 
-    // minMove (ruido)
     final minMove = _minMoveThresholdMeters(filtered.accuracy);
     if (d < minMove) {
-      // No sumamos distancia ni dibujamos, pero la UI igual se refresca por ticker.
       return;
     }
 
-    // maxSpeed (200 km/h)
     final maxJump = _maxAllowedJumpMeters(dtSafe);
     if (d > maxJump) {
       return;
     }
 
-    // Aceptar
     distanceMeters += d;
-    traveledPath.add(useLatLng);
+
+    // UI: agrega menos puntos para que la polyline no se vuelva “pesada”
+    _addTraveledPointForUi(useLatLng);
 
     _lastAccepted = _GpsSample(
       lat: useLatLng.latitude,

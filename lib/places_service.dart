@@ -1,3 +1,4 @@
+import 'dart:collection';
 import 'dart:convert';
 import 'dart:math';
 import 'package:http/http.dart' as http;
@@ -25,11 +26,19 @@ class PlacesService {
   /// Radio en metros para “SLP” (ajústalo)
   final int slpRadiusMeters;
 
+  /// Cache de Place Details (placeId -> LatLng)
+  final Duration detailsTtl;
+  final int detailsMaxEntries;
+
+  final LinkedHashMap<String, _LatLngCacheEntry> _detailsCache = LinkedHashMap();
+
   PlacesService(
       this.apiKey, {
         this.restrictToSlp = false,
         LatLng? slpCenter,
         this.slpRadiusMeters = 45000, // 45 km aprox
+        this.detailsTtl = const Duration(minutes: 30),
+        this.detailsMaxEntries = 200,
       }) : slpCenter = slpCenter ?? const LatLng(22.1565, -100.9855);
 
   /// Token público (por si lo quieres manejar desde UI)
@@ -38,9 +47,11 @@ class PlacesService {
     return '${DateTime.now().millisecondsSinceEpoch}-${r.nextInt(1 << 32)}';
   }
 
-  /// ✅ FIX: alias privado para evitar el error de _sessionToken no encontrado
   String _sessionToken() => newSessionToken();
 
+  /// -----------------------------
+  /// AUTOCOMPLETE (Places)
+  /// -----------------------------
   Future<List<PlacePrediction>> autocomplete(
       String input, {
         LatLng? locationBias,
@@ -92,40 +103,54 @@ class PlacesService {
       throw Exception('Places Autocomplete $status${msg.isEmpty ? "" : " - $msg"}');
     }
 
-    final preds = (body['predictions'] as List<dynamic>? ?? []);
-    final items = preds.map((p) {
+    final preds = (body['predictions'] as List<dynamic>? ?? const []);
+    final items = preds
+        .map((p) {
       final m = p as Map<String, dynamic>;
       return PlacePrediction(
         placeId: (m['place_id'] ?? '').toString(),
         description: (m['description'] ?? '').toString(),
       );
-    }).where((p) => p.placeId.isNotEmpty && p.description.isNotEmpty).toList();
+    })
+        .where((p) => p.placeId.isNotEmpty && p.description.isNotEmpty)
+        .toList();
 
     if (items.length <= maxResults) return items;
     return items.take(maxResults).toList();
   }
 
-  /// Devuelve null si:
-  /// - no hay geometry
-  /// - y/o requireSlp=true y el lugar NO pertenece al estado de San Luis Potosí
+  /// -----------------------------
+  /// DETAILS: placeId -> LatLng
+  /// -----------------------------
+  ///
+  /// Optimización de costo:
+  /// - por defecto SOLO pedimos geometry/location
+  /// - validación SLP por radio (no por address_components)
+  /// - cache LRU con TTL para no repetir Place Details
   Future<LatLng?> placeIdToLatLng(
       String placeId, {
         String? sessionToken,
         bool requireSlp = false,
+        bool bypassCache = false,
       }) async {
+    final id = placeId.trim();
+    if (id.isEmpty) return null;
+
+    if (!bypassCache) {
+      final cached = _getFromCache(id);
+      if (cached != null) return cached;
+    }
+
     final token = (sessionToken != null && sessionToken.isNotEmpty)
         ? sessionToken
         : _sessionToken();
 
-    // Si quieres “forzar” que sea SLP, necesitamos address_components
-    final mustCheckSlp = requireSlp || restrictToSlp;
-    final fields = mustCheckSlp ? 'geometry/location,address_components' : 'geometry/location';
-
+    // 👇 IMPORTANTE: SOLO geometry/location (barato)
     final uri = Uri.https('maps.googleapis.com', '/maps/api/place/details/json', {
-      'place_id': placeId,
+      'place_id': id,
       'key': apiKey,
       'language': 'es',
-      'fields': fields,
+      'fields': 'geometry/location',
       'sessiontoken': token,
     });
 
@@ -144,47 +169,75 @@ class PlacesService {
     final result = body['result'] as Map<String, dynamic>?;
     if (result == null) return null;
 
-    if (mustCheckSlp) {
-      final comps = (result['address_components'] as List<dynamic>? ?? const []);
-      if (comps.isEmpty) return null;
-      if (!_isSanLuisPotosi(comps)) return null;
-    }
-
     final geom = result['geometry'] as Map<String, dynamic>?;
     final loc = geom?['location'] as Map<String, dynamic>?;
     final lat = (loc?['lat'] as num?)?.toDouble();
     final lng = (loc?['lng'] as num?)?.toDouble();
-
     if (lat == null || lng == null) return null;
-    return LatLng(lat, lng);
-  }
 
-  bool _isSanLuisPotosi(List<dynamic> components) {
-    String? stateLong;
-    String? countryShort;
+    final ll = LatLng(lat, lng);
 
-    for (final c in components) {
-      final m = c as Map<String, dynamic>;
-      final types = (m['types'] as List<dynamic>? ?? const [])
-          .map((e) => e.toString())
-          .toList();
-
-      if (types.contains('administrative_area_level_1')) {
-        stateLong = (m['long_name'] ?? '').toString();
-      }
-      if (types.contains('country')) {
-        countryShort = (m['short_name'] ?? '').toString();
+    // Validación SLP por radio/círculo (sin pedir address_components)
+    final mustCheckSlp = requireSlp || restrictToSlp;
+    if (mustCheckSlp) {
+      final d = _haversineMeters(ll, slpCenter);
+      if (d > slpRadiusMeters) {
+        return null;
       }
     }
 
-    final normalized = (stateLong ?? '')
-        .toLowerCase()
-        .replaceAll('ó', 'o')
-        .replaceAll('á', 'a')
-        .replaceAll('é', 'e')
-        .replaceAll('í', 'i')
-        .replaceAll('ú', 'u');
-
-    return countryShort == 'MX' && normalized.contains('san luis potosi');
+    _putCache(id, ll);
+    return ll;
   }
+
+  /// -----------------------------
+  /// Cache LRU con TTL
+  /// -----------------------------
+  LatLng? _getFromCache(String placeId) {
+    final entry = _detailsCache.remove(placeId); // LRU
+    if (entry == null) return null;
+
+    if (DateTime.now().isAfter(entry.expiresAt)) {
+      return null;
+    }
+
+    _detailsCache[placeId] = entry;
+    return entry.value;
+  }
+
+  void _putCache(String placeId, LatLng value) {
+    _detailsCache.remove(placeId);
+    _detailsCache[placeId] = _LatLngCacheEntry(value, DateTime.now().add(detailsTtl));
+
+    while (_detailsCache.length > detailsMaxEntries) {
+      _detailsCache.remove(_detailsCache.keys.first);
+    }
+  }
+
+  void clearDetailsCache() => _detailsCache.clear();
+
+  /// -----------------------------
+  /// Distancia Haversine (sin geolocator)
+  /// -----------------------------
+  static const double _R = 6371000.0;
+
+  double _haversineMeters(LatLng a, LatLng b) {
+    final dLat = _deg2rad(b.latitude - a.latitude);
+    final dLon = _deg2rad(b.longitude - a.longitude);
+    final lat1 = _deg2rad(a.latitude);
+    final lat2 = _deg2rad(b.latitude);
+
+    final h = sin(dLat / 2) * sin(dLat / 2) +
+        cos(lat1) * cos(lat2) * sin(dLon / 2) * sin(dLon / 2);
+    final c = 2 * atan2(sqrt(h), sqrt(1 - h));
+    return _R * c;
+  }
+
+  double _deg2rad(double d) => d * pi / 180.0;
+}
+
+class _LatLngCacheEntry {
+  final LatLng value;
+  final DateTime expiresAt;
+  const _LatLngCacheEntry(this.value, this.expiresAt);
 }
