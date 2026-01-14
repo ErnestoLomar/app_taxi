@@ -13,6 +13,7 @@ import 'directions_service.dart';
 import 'places_service.dart';
 import 'place_autocomplete_field.dart';
 import 'route_info.dart';
+import 'trip_exporter.dart';
 
 late final String kGoogleWebKey;
 
@@ -90,35 +91,6 @@ class TaxiMapTaximeterPage extends StatefulWidget {
 class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
   GoogleMapController? _map;
 
-  // -------------------------
-  // Auto-cálculo de ruta (debounce / dedupe / rate-limit)
-  // -------------------------
-  Timer? _autoRouteDebounce;
-  LatLng? _lastRouteOrigin;
-  LatLng? _lastRouteDest;
-  DateTime _lastRouteCalcAt = DateTime.fromMillisecondsSinceEpoch(0);
-
-  // -------------------------
-  // Rerouting (recalcular ruta)
-  // -------------------------
-  bool _rerouting = false;
-  DateTime _lastRerouteAt = DateTime.fromMillisecondsSinceEpoch(0);
-
-  DateTime? _offRouteSince;
-  int _offRouteHits = 0;
-
-  Timer? _rerouteTimer;
-  double _distanceAtLastReroute = 0;
-
-  // Ajustes para bajar costo (Directions):
-  static const Duration _rerouteCheckEvery = Duration(seconds: 4);
-  static const int _hitsNeeded = 3; // 3 checks * 4s = ~12s persistente
-  static const int _cooldownSeconds = 180; // 3 min mínimo entre reroutes
-  static const double _baseThresholdMeters = 70.0;
-  static const double _minSpeedForRerouteMps = 1.5; // ~5.4 km/h
-  static const double _minDistanceSinceLastReroute = 80.0; // evita cascadas
-  static const double _skipRerouteIfNearDestMeters = 220.0;
-
   bool _followCar = true;
   bool _isProgrammaticMove = false;
   DateTime _lastFollowMove = DateTime.fromMillisecondsSinceEpoch(0);
@@ -145,6 +117,14 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
   bool _loadingRoute = false;
   bool _startingTrip = false;
 
+  // Export
+  bool _exporting = false;
+
+  // Auto-route (sin botón)
+  Timer? _autoRouteDebounce;
+  String? _lastAutoRouteKey;
+
+  // Centro SLP para sesgar autocompletado
   static const LatLng _slpCenter = LatLng(22.1565, -100.9855);
 
   @override
@@ -177,12 +157,8 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
     _places = PlacesService(
       kGoogleWebKey,
       restrictToSlp: true,
+      // slpRadiusMeters: 60000,
     );
-
-    // Reroute con timer (no en cada update) => menos CPU y menos riesgo de llamar Directions de más
-    _rerouteTimer = Timer.periodic(_rerouteCheckEvery, (_) {
-      _maybeRerouteIfOffRoute();
-    });
 
     _centerOnUserOnce();
   }
@@ -190,15 +166,13 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
   @override
   void dispose() {
     _autoRouteDebounce?.cancel();
-    _rerouteTimer?.cancel();
     _originCtl.dispose();
     _destCtl.dispose();
     _taximeter.dispose();
     super.dispose();
   }
 
-  bool get _locked =>
-      _taximeter.running || _phase == RidePhase.inTrip || _startingTrip;
+  bool get _locked => _taximeter.running || _phase == RidePhase.inTrip || _startingTrip;
 
   Future<void> _centerOnUserOnce() async {
     try {
@@ -327,44 +301,37 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
     }
   }
 
-  void _resetRouteState() {
-    _route = null;
-    _taximeter.setPlannedRoute(const []);
-    if (_phase != RidePhase.inTrip) _phase = RidePhase.idle;
+  String _coordsKey(LatLng o, LatLng d) {
+    int e5(double v) => (v * 1e5).round();
+    return '${e5(o.latitude)},${e5(o.longitude)}-${e5(d.latitude)},${e5(d.longitude)}';
   }
 
   void _scheduleAutoRoute() {
+    if (_locked) return;
     if (_origin == null || _destination == null) return;
-    if (_locked || _loadingRoute || _rerouting) return;
 
-    // Si ya hay ruta y O/D no cambiaron (≈8m), no recalcular
-    final sameO = _lastRouteOrigin != null &&
-        Geolocator.distanceBetween(
-          _lastRouteOrigin!.latitude,
-          _lastRouteOrigin!.longitude,
-          _origin!.latitude,
-          _origin!.longitude,
-        ) <
-            8;
-
-    final sameD = _lastRouteDest != null &&
-        Geolocator.distanceBetween(
-          _lastRouteDest!.latitude,
-          _lastRouteDest!.longitude,
-          _destination!.latitude,
-          _destination!.longitude,
-        ) <
-            8;
-
-    if (_route != null && _route!.polyline.length >= 2 && sameO && sameD) return;
-
-    // Rate-limit extra (además del debounce)
-    if (DateTime.now().difference(_lastRouteCalcAt).inMilliseconds < 2000) return;
+    final key = _coordsKey(_origin!, _destination!);
+    if (key == _lastAutoRouteKey && (_loadingRoute || _phase == RidePhase.routeReady)) return;
 
     _autoRouteDebounce?.cancel();
-    _autoRouteDebounce = Timer(const Duration(milliseconds: 600), () {
-      _calculateRoute(auto: true);
+    _autoRouteDebounce = Timer(const Duration(milliseconds: 380), () async {
+      if (!mounted) return;
+      if (_locked) return;
+      if (_origin == null || _destination == null) return;
+
+      final key2 = _coordsKey(_origin!, _destination!);
+      if (key2 == _lastAutoRouteKey && (_loadingRoute || _phase == RidePhase.routeReady)) return;
+
+      _lastAutoRouteKey = key2;
+      await _calculateRoute();
     });
+  }
+
+  void _resetRouteState() {
+    _route = null;
+    _taximeter.setPlannedRoute(const []);
+    _lastAutoRouteKey = null;
+    if (_phase != RidePhase.inTrip) _phase = RidePhase.idle;
   }
 
   void _onMapTap(LatLng p) {
@@ -378,68 +345,59 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
       } else if (_destination == null) {
         _destination = p;
         _destCtl.text = 'Punto seleccionado';
-        _status = 'Calculando ruta...';
+        _status = 'Destino listo. Calculando ruta...';
       } else {
         _destination = p;
         _destCtl.text = 'Punto seleccionado';
-        _status = 'Calculando ruta...';
+        _status = 'Destino actualizado. Calculando ruta...';
       }
       _resetRouteState();
     });
 
-    _scheduleAutoRoute();
+    if (_origin != null && _destination != null) _scheduleAutoRoute();
   }
 
   Future<void> _setOriginFromPlace(String desc, String placeId, String token) async {
     if (_locked) return;
-
     final ll = await _places.placeIdToLatLng(placeId, sessionToken: token, requireSlp: true);
     if (ll == null) {
       setState(() => _status = 'No se pudo obtener coordenadas del origen');
       return;
     }
-
     setState(() {
       _origin = ll;
+      _status = (_destination == null) ? 'Origen listo. Selecciona destino' : 'Origen actualizado. Calculando ruta...';
       _resetRouteState();
-      _status = (_destination != null) ? 'Calculando ruta...' : 'Origen listo. Selecciona destino';
     });
-
     await _map?.animateCamera(CameraUpdate.newLatLngZoom(ll, 15));
-    _scheduleAutoRoute();
+    if (_origin != null && _destination != null) _scheduleAutoRoute();
   }
 
   Future<void> _setDestFromPlace(String desc, String placeId, String token) async {
     if (_locked) return;
-
     final ll = await _places.placeIdToLatLng(placeId, sessionToken: token, requireSlp: true);
     if (ll == null) {
       setState(() => _status = 'No se pudo obtener coordenadas del destino');
       return;
     }
-
     setState(() {
       _destination = ll;
+      _status = 'Destino listo. Calculando ruta...';
       _resetRouteState();
-      _status = (_origin != null) ? 'Calculando ruta...' : 'Destino listo. Selecciona origen';
     });
-
     await _map?.animateCamera(CameraUpdate.newLatLngZoom(ll, 15));
-    _scheduleAutoRoute();
+    if (_origin != null && _destination != null) _scheduleAutoRoute();
   }
 
-  Future<void> _calculateRoute({bool auto = false}) async {
+  Future<void> _calculateRoute() async {
     if (_origin == null || _destination == null || _locked) return;
+    if (_loadingRoute) return;
 
     setState(() {
       _loadingRoute = true;
       _status = 'Calculando ruta...';
+      _phase = RidePhase.idle;
     });
-
-    // Dedupe para evitar recalcular lo mismo (costo)
-    _lastRouteOrigin = _origin;
-    _lastRouteDest = _destination;
-    _lastRouteCalcAt = DateTime.now();
 
     try {
       final r = await _directions.fetchRoute(origin: _origin!, destination: _destination!);
@@ -515,14 +473,7 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
       _status = 'Iniciando viaje...';
     });
 
-    _taximeter.resetTripTrace();
     _taximeter.setPlannedRoute(_route!.polyline);
-
-    // reset detector reroute
-    _offRouteSince = null;
-    _offRouteHits = 0;
-    _distanceAtLastReroute = 0;
-    _lastRerouteAt = DateTime.fromMillisecondsSinceEpoch(0);
 
     try {
       await _taximeter.start();
@@ -545,7 +496,7 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
 
   Future<void> _stopTrip() async {
     if (!_taximeter.running) return;
-    await _taximeter.stop();
+    _taximeter.stop();
     if (!mounted) return;
     setState(() {
       _phase = RidePhase.finished;
@@ -553,16 +504,33 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
     });
   }
 
+  Future<void> _exportTrip() async {
+    if (_exporting) return;
+
+    setState(() => _exporting = true);
+    try {
+      await TripExporter.exportAndShare(
+        taxi: _taximeter,
+        origin: _origin,
+        destination: _destination,
+        originLabel: _originCtl.text.trim().isEmpty ? null : _originCtl.text.trim(),
+        destinationLabel: _destCtl.text.trim().isEmpty ? null : _destCtl.text.trim(),
+        plannedRoute: _route?.polyline ?? const [],
+      );
+      _snack('Datos del viaje exportados.');
+    } catch (e) {
+      _snack('Error exportando: $e');
+    } finally {
+      if (mounted) setState(() => _exporting = false);
+    }
+  }
+
   void _clearAll() {
     if (_taximeter.running || _startingTrip) return;
 
-    _autoRouteDebounce?.cancel();
-    _lastRouteOrigin = null;
-    _lastRouteDest = null;
-    _lastRouteCalcAt = DateTime.fromMillisecondsSinceEpoch(0);
-
     _taximeter.setPlannedRoute(const []);
-    _taximeter.resetTripTrace();
+    _autoRouteDebounce?.cancel();
+    _lastAutoRouteKey = null;
 
     setState(() {
       _origin = null;
@@ -573,110 +541,6 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
       _phase = RidePhase.idle;
       _status = 'Escribe ORIGEN y DESTINO o toca el mapa';
     });
-  }
-
-  // -------------------------
-  // Reroute “barato” (menos Directions)
-  // -------------------------
-  Future<void> _maybeRerouteIfOffRoute() async {
-    if (!_taximeter.running) return;
-    if (_destination == null) return;
-    if (_route == null || _route!.polyline.length < 2) return;
-    if (_rerouting) return;
-
-    final pos = _taximeter.currentPosition;
-    if (pos == null) return;
-
-    // Evita reroute si vas casi detenido (reduce falsos positivos y costo)
-    if (pos.speed.isFinite && pos.speed < _minSpeedForRerouteMps) {
-      _offRouteSince = null;
-      _offRouteHits = 0;
-      return;
-    }
-
-    // Si ya estás muy cerca del destino, no reroute
-    final distToDest = Geolocator.distanceBetween(
-      pos.latitude,
-      pos.longitude,
-      _destination!.latitude,
-      _destination!.longitude,
-    );
-    if (distToDest < _skipRerouteIfNearDestMeters) {
-      _offRouteSince = null;
-      _offRouteHits = 0;
-      return;
-    }
-
-    // Evita cascadas: exige un mínimo de avance desde el último reroute
-    if ((_taximeter.distanceMeters - _distanceAtLastReroute) < _minDistanceSinceLastReroute) {
-      return;
-    }
-
-    // Usa distancia a ruta ya computada en el controller (casi “gratis” CPU)
-    final distToRoute = _taximeter.distanceToPlannedRouteMeters;
-    if (distToRoute == null) return;
-
-    final now = DateTime.now();
-
-    // Umbral dinámico: base + depende de accuracy
-    final acc = (pos.accuracy.isFinite ? pos.accuracy : 25.0);
-    final threshold = max(_baseThresholdMeters, acc * 2.6);
-
-    // Cooldown fuerte
-    final cooldownOk = now.difference(_lastRerouteAt).inSeconds >= _cooldownSeconds;
-    if (!cooldownOk) return;
-
-    if (distToRoute > threshold) {
-      _offRouteSince ??= now;
-      _offRouteHits++;
-
-      if (_offRouteHits >= _hitsNeeded) {
-        final from = _taximeter.rawLatLng ?? LatLng(pos.latitude, pos.longitude);
-        await _doReroute(from: from);
-      }
-    } else {
-      _offRouteSince = null;
-      _offRouteHits = 0;
-    }
-  }
-
-  Future<void> _doReroute({required LatLng from}) async {
-    if (_destination == null) return;
-
-    _rerouting = true;
-    setState(() => _status = 'Recalculando ruta...');
-
-    try {
-      final r = await _directions.fetchRoute(
-        origin: from,
-        destination: _destination!,
-      );
-
-      if (r.polyline.length >= 2) {
-        setState(() {
-          _route = r;
-          _status = 'Ruta actualizada';
-        });
-
-        _taximeter.setPlannedRoute(r.polyline);
-
-        _offRouteSince = null;
-        _offRouteHits = 0;
-        _lastRerouteAt = DateTime.now();
-        _distanceAtLastReroute = _taximeter.distanceMeters;
-
-        // Actualiza dedupe para no auto-recalcular de nuevo por debounce
-        _lastRouteOrigin = from;
-        _lastRouteDest = _destination;
-        _lastRouteCalcAt = DateTime.now();
-      } else {
-        setState(() => _status = 'No se encontró ruta alternativa');
-      }
-    } catch (e) {
-      setState(() => _status = 'Error al recalcular ruta: $e');
-    } finally {
-      _rerouting = false;
-    }
   }
 
   String _formatDuration(Duration d) {
@@ -847,9 +711,7 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
               children: [
                 fabSmall(
                   tag: 'btn_fit_route',
-                  onPressed: (_route != null && _route!.polyline.isNotEmpty)
-                      ? () => _fitBounds(_route!.polyline)
-                      : null,
+                  onPressed: (_route != null && _route!.polyline.isNotEmpty) ? () => _fitBounds(_route!.polyline) : null,
                   child: const Icon(Icons.center_focus_strong),
                 ),
                 const SizedBox(height: 10),
@@ -911,6 +773,7 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
                           ),
                         ),
                         const SizedBox(height: 10),
+
                         Text(
                           _status,
                           style: TextStyle(fontSize: 13, color: scheme.onSurface.withOpacity(0.75)),
@@ -955,10 +818,7 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
                             rows: [
                               _SummaryRow('Distancia', '${_route!.distanceKm.toStringAsFixed(2)} km'),
                               _SummaryRow('Tiempo aprox.', _formatEta(_route!.duration)),
-                              _SummaryRow(
-                                'Tarifa estimada',
-                                estFare == null ? '-' : '\$${estFare.toStringAsFixed(2)}',
-                              ),
+                              _SummaryRow('Tarifa estimada', estFare == null ? '-' : '\$${estFare.toStringAsFixed(2)}'),
                             ],
                           ),
 
@@ -986,11 +846,23 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
 
                         const SizedBox(height: 12),
 
-                        // ✅ Ya no hay botón "Calcular ruta".
-                        // La ruta se calcula automáticamente al tener origen + destino.
-                        SizedBox(
-                          width: double.infinity,
-                          child: FilledButton.icon(
+                        // ✅ Botones finales (sin "Calcular ruta")
+                        if (_phase == RidePhase.finished) ...[
+                          OutlinedButton.icon(
+                            onPressed: _exporting ? null : _exportTrip,
+                            icon: _exporting
+                                ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                                : const Icon(Icons.download),
+                            label: Text(_exporting ? 'Exportando...' : 'Exportar'),
+                          ),
+                          const SizedBox(height: 10),
+                          FilledButton.icon(
+                            onPressed: _clearAll,
+                            icon: const Icon(Icons.refresh),
+                            label: const Text('Nuevo viaje'),
+                          ),
+                        ] else ...[
+                          FilledButton.icon(
                             onPressed: () async {
                               if (_startingTrip) return;
 
@@ -998,36 +870,24 @@ class _TaxiMapTaximeterPageState extends State<TaxiMapTaximeterPage> {
                                 await _startTrip();
                               } else if (_phase == RidePhase.inTrip) {
                                 await _stopTrip();
-                              } else if (_phase == RidePhase.finished) {
-                                _clearAll();
-                              } else {
-                                // idle: aún no hay ruta lista; se calcula sola al poner origen+destino
-                                // (no hacemos nada)
                               }
                             },
                             icon: _startingTrip
                                 ? const SizedBox(
                               width: 16,
                               height: 16,
-                              child: CircularProgressIndicator(
-                                strokeWidth: 2,
-                                color: Colors.white,
-                              ),
+                              child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
                             )
-                                : Icon(
-                              _phase == RidePhase.inTrip
-                                  ? Icons.stop
-                                  : (_phase == RidePhase.finished ? Icons.refresh : Icons.play_arrow),
-                            ),
+                                : (_phase == RidePhase.inTrip ? const Icon(Icons.stop) : const Icon(Icons.play_arrow)),
                             label: Text(
                               _startingTrip
                                   ? 'Iniciando...'
                                   : (_phase == RidePhase.inTrip
                                   ? 'Detener'
-                                  : (_phase == RidePhase.finished ? 'Nuevo viaje' : 'Iniciar viaje')),
+                                  : (_loadingRoute ? 'Calculando ruta...' : 'Iniciar viaje')),
                             ),
                           ),
-                        ),
+                        ],
                       ],
                     ),
                   ),

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:math';
 import 'dart:ui' show Offset;
 
@@ -8,83 +9,135 @@ import 'package:google_maps_flutter/google_maps_flutter.dart';
 
 import 'fare_config.dart';
 
-class _GpsSample {
-  final double lat;
-  final double lng;
-  final double accuracy;
-  final double speed; // m/s
-  final double heading; // degrees
+class TripSample {
   final DateTime time;
+  final int elapsedMs;
 
-  const _GpsSample({
-    required this.lat,
-    required this.lng,
+  final LatLng raw;      // GPS crudo
+  final LatLng filtered; // tras mediana
+  final LatLng used;     // lo que se usa (snapped o filtered)
+
+  final bool snapped;
+  final double? distToRouteMeters;
+
+  final double accuracy;
+  final double speed;
+  final double heading;
+
+  final bool accepted;
+  final String reason; // accepted | seed | min_move | max_jump | bad_accuracy | not_running
+
+  final double? deltaMeters;
+  final double? dtSeconds;
+
+  final double cumulativeDistanceMeters;
+  final int units;
+  final double fare;
+
+  const TripSample({
+    required this.time,
+    required this.elapsedMs,
+    required this.raw,
+    required this.filtered,
+    required this.used,
+    required this.snapped,
+    required this.distToRouteMeters,
     required this.accuracy,
     required this.speed,
     required this.heading,
-    required this.time,
+    required this.accepted,
+    required this.reason,
+    required this.deltaMeters,
+    required this.dtSeconds,
+    required this.cumulativeDistanceMeters,
+    required this.units,
+    required this.fare,
   });
-}
 
-class _ClosestOnRoute {
-  final LatLng point;
-  final double distMeters;
-  final int segIndex;
-
-  const _ClosestOnRoute(this.point, this.distMeters, this.segIndex);
+  Map<String, dynamic> toJson() => {
+    'time_iso': time.toIso8601String(),
+    'elapsed_ms': elapsedMs,
+    'accepted': accepted,
+    'reason': reason,
+    'raw': {'lat': raw.latitude, 'lng': raw.longitude},
+    'filtered': {'lat': filtered.latitude, 'lng': filtered.longitude},
+    'used': {'lat': used.latitude, 'lng': used.longitude},
+    'snapped': snapped,
+    'dist_to_route_m': distToRouteMeters,
+    'accuracy_m': accuracy,
+    'speed_mps': speed,
+    'heading_deg': heading,
+    'delta_m': deltaMeters,
+    'dt_s': dtSeconds,
+    'cum_distance_m': cumulativeDistanceMeters,
+    'units': units,
+    'fare': fare,
+  };
 }
 
 class TaximeterController extends ChangeNotifier {
   final FareConfig config;
 
-  bool running = false;
-
   Shift shift;
   ServiceChannel channel;
 
-  double distanceMeters = 0;
+  bool running = false;
+
   final Stopwatch _stopwatch = Stopwatch();
-
-  _GpsSample? _lastAccepted;
-
-  /// Posición para UI (puede ser snappeada si hay ruta)
-  Position? currentPosition;
-
-  /// Última posición “filtrada” sin snap (útil para reroute)
-  LatLng? _rawLatLng;
-
-  /// Distancia (m) desde la posición filtrada al punto más cercano de la ruta planeada
-  double? _distanceToPlannedRouteMeters;
-
-  /// Si el último update aplicó snap a la ruta azul
-  bool _snappedLast = false;
-
-  StreamSubscription<Position>? _sub;
   Timer? _ticker;
-  Timer? _switchToNormalFilterTimer;
+
+  double distanceMeters = 0.0;
 
   final List<LatLng> traveledPath = [];
 
+  Position? currentPosition;
+
+  LatLng? _rawLatLng;
+  LatLng? get rawLatLng => _rawLatLng;
+
+  double? _distanceToPlannedRouteMeters;
+  double? get distanceToPlannedRouteMeters => _distanceToPlannedRouteMeters;
+
+  bool _snappedLast = false;
+  bool get snappedLast => _snappedLast;
+
+  DateTime? tripStartedAt;
+  DateTime? tripEndedAt;
+
   // ------------------------
-  // Filtros / parámetros
+  // Logging (para export)
+  // ------------------------
+  bool logGpsSamples = true;
+  static const int _maxLoggedSamples = 20000;
+  final List<TripSample> _samples = [];
+  UnmodifiableListView<TripSample> get samples => UnmodifiableListView(_samples);
+
+  void _pushSample(TripSample s) {
+    if (!logGpsSamples) return;
+    _samples.add(s);
+    if (_samples.length > _maxLoggedSamples) {
+      final overflow = _samples.length - _maxLoggedSamples;
+      _samples.removeRange(0, overflow);
+    }
+  }
+
+  // ------------------------
+  // GPS smoothing / filtros
   // ------------------------
 
-  static const int _medianWindowSize = 5;
+  static const int _windowSize = 5;
   final List<_GpsSample> _window = [];
 
   static const double _maxAccuracyMeters = 35.0;
 
-  static const double _maxSpeedMps = 200.0 / 3.6; // 55.55 m/s
+  static const double _maxSpeedMps = 200.0 / 3.6;
   static const double _maxSpeedMargin = 1.15;
 
   static const double _minMoveBaseMeters = 3.0;
+
   static const double _absoluteMaxJumpMeters = 0.0;
 
-  // ------------------------
-  // UI optimization: thinning
-  // ------------------------
-  static const double _uiMinSegmentMeters = 6.0; // no dibujar micro-segmentos
-  static const int _uiMaxPoints = 2500; // cap opcional para viajes muy largos
+  _GpsSample? _lastAccepted;
 
   // ------------------------
   // SNAP a ruta (map matching local)
@@ -93,13 +146,7 @@ class TaximeterController extends ChangeNotifier {
   List<LatLng> _plannedRoute = const [];
   int _routeCursor = -1;
 
-  /// Activa/desactiva snapping a la ruta azul
   bool snapToPlannedRoute = true;
-
-  /// Exponer para main
-  LatLng? get rawLatLng => _rawLatLng;
-  double? get distanceToPlannedRouteMeters => _distanceToPlannedRouteMeters;
-  bool get snappedLast => _snappedLast;
 
   TaximeterController(
       this.config, {
@@ -109,8 +156,7 @@ class TaximeterController extends ChangeNotifier {
 
   Duration get elapsed => _stopwatch.elapsed;
 
-  int get units =>
-      config.unitsFromTotals(distanceMeters: distanceMeters, elapsed: elapsed);
+  int get units => config.unitsFromTotals(distanceMeters: distanceMeters, elapsed: elapsed);
 
   double get fare => config.fareFromTotals(
     shift: shift,
@@ -151,6 +197,11 @@ class TaximeterController extends ChangeNotifier {
     _rawLatLng = null;
     _distanceToPlannedRouteMeters = null;
     _snappedLast = false;
+
+    _samples.clear();
+    tripStartedAt = null;
+    tripEndedAt = null;
+
     notifyListeners();
   }
 
@@ -172,7 +223,7 @@ class TaximeterController extends ChangeNotifier {
   // ------------------------
 
   double _medianOf(List<double> values) {
-    final v = [...values]..sort();
+    final v = List<double>.from(values)..sort();
     final n = v.length;
     if (n == 0) return 0.0;
     final mid = n ~/ 2;
@@ -191,57 +242,318 @@ class TaximeterController extends ChangeNotifier {
     );
   }
 
-  double _minMoveThresholdMeters(double accuracyMeters) {
-    final dyn = accuracyMeters * 0.6;
-    return max(_minMoveBaseMeters, min(20.0, dyn));
-  }
-
-  double _maxAllowedJumpMeters(Duration dt) {
-    final seconds = max(1.0, dt.inMilliseconds / 1000.0);
-    var maxDist = _maxSpeedMps * seconds * _maxSpeedMargin;
-    if (_absoluteMaxJumpMeters > 0) maxDist = min(maxDist, _absoluteMaxJumpMeters);
-    return maxDist;
-  }
-
   // ------------------------
-  // SNAP helpers
+  // Start / Stop
   // ------------------------
 
-  double _snapRadiusMeters(double accuracyMeters) {
-    // Menor radio = menos “pegado” a calles paralelas y mejor detección de desviación.
-    return max(12.0, min(40.0, accuracyMeters * 1.6));
-  }
+  StreamSubscription<Position>? _sub;
 
-  static const double _R = 6371000.0;
-  double _deg2rad(double d) => d * pi / 180.0;
-  double _rad2deg(double r) => r * 180.0 / pi;
+  Future<bool> start() async {
+    if (running) return false;
 
-  Offset _toXY(LatLng ll, LatLng p, double cosLat) {
-    final dLat = _deg2rad(ll.latitude - p.latitude);
-    final dLon = _deg2rad(ll.longitude - p.longitude);
-    final x = dLon * _R * cosLat;
-    final y = dLat * _R;
-    return Offset(x, y);
-  }
+    final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+    if (!serviceEnabled) return false;
 
-  LatLng _xyToLatLng(Offset xy, LatLng p, double cosLat) {
-    final dLat = xy.dy / _R;
-    final dLon = (cosLat.abs() < 1e-8) ? 0.0 : (xy.dx / (_R * cosLat));
-    return LatLng(
-      p.latitude + _rad2deg(dLat),
-      p.longitude + _rad2deg(dLon),
+    LocationPermission perm = await Geolocator.checkPermission();
+    if (perm == LocationPermission.denied) perm = await Geolocator.requestPermission();
+    if (perm == LocationPermission.denied || perm == LocationPermission.deniedForever) return false;
+
+    running = true;
+    tripEndedAt = null;
+
+    _stopwatch.reset();
+    _stopwatch.start();
+    tripStartedAt = DateTime.now();
+
+    _startTicker();
+
+    final settings = const LocationSettings(
+      accuracy: LocationAccuracy.bestForNavigation,
+      distanceFilter: 0,
     );
+
+    _sub = Geolocator.getPositionStream(locationSettings: settings).listen(
+          (pos) => _ingestPosition(pos),
+      onError: (_) {},
+    );
+
+    notifyListeners();
+    return true;
   }
 
-  _ClosestOnRoute? _closestPointOnPlannedRoute(LatLng p) {
-    if (_plannedRoute.length < 2) return null;
+  void stop() {
+    if (!running) return;
 
-    final latRad = _deg2rad(p.latitude);
-    final cosLat = cos(latRad);
+    running = false;
+    _sub?.cancel();
+    _sub = null;
 
-    final n = _plannedRoute.length;
+    _stopwatch.stop();
+    _stopTicker();
+
+    tripEndedAt = DateTime.now();
+
+    notifyListeners();
+  }
+
+  @override
+  void dispose() {
+    _sub?.cancel();
+    _ticker?.cancel();
+    super.dispose();
+  }
+
+  // ------------------------
+  // Core ingest
+  // ------------------------
+
+  void _ingestPosition(Position pos) {
+    final now = pos.timestamp ?? DateTime.now();
+    final elapsedMs = _stopwatch.elapsedMilliseconds;
+
+    if (!running) {
+      // (opcional) loggear aunque no esté corriendo
+      return;
+    }
+
+    final acc = (pos.accuracy.isFinite ? pos.accuracy : 9999.0);
+    final speed = (pos.speed.isFinite ? pos.speed : 0.0);
+    final heading = (pos.heading.isFinite ? pos.heading : 0.0);
+
+    final raw = LatLng(pos.latitude, pos.longitude);
+    _rawLatLng = raw;
+    currentPosition = pos;
+
+    // Accuracy filter
+    if (acc > _maxAccuracyMeters) {
+      _pushSample(
+        TripSample(
+          time: now,
+          elapsedMs: elapsedMs,
+          raw: raw,
+          filtered: raw,
+          used: raw,
+          snapped: false,
+          distToRouteMeters: _distanceToPlannedRouteMeters,
+          accuracy: acc,
+          speed: speed,
+          heading: heading,
+          accepted: false,
+          reason: 'bad_accuracy',
+          deltaMeters: null,
+          dtSeconds: null,
+          cumulativeDistanceMeters: distanceMeters,
+          units: units,
+          fare: fare,
+        ),
+      );
+      notifyListeners();
+      return;
+    }
+
+    // Mediana window
+    _window.add(_GpsSample(
+      lat: raw.latitude,
+      lng: raw.longitude,
+      accuracy: acc,
+      speed: speed,
+      heading: heading,
+      time: now,
+    ));
+    if (_window.length > _windowSize) _window.removeAt(0);
+
+    final med = _medianSample(_window);
+    final filtered = LatLng(med.lat, med.lng);
+
+    // Snap (si hay ruta)
+    final used = _maybeSnap(filtered, now);
+
+    // Cálculo de distancia incremental
+    final last = _lastAccepted;
+    if (last == null) {
+      _lastAccepted = _GpsSample(
+        lat: used.latitude,
+        lng: used.longitude,
+        accuracy: med.accuracy,
+        speed: med.speed,
+        heading: med.heading,
+        time: now,
+      );
+
+      traveledPath.add(used);
+
+      _pushSample(
+        TripSample(
+          time: now,
+          elapsedMs: elapsedMs,
+          raw: raw,
+          filtered: filtered,
+          used: used,
+          snapped: _snappedLast,
+          distToRouteMeters: _distanceToPlannedRouteMeters,
+          accuracy: med.accuracy,
+          speed: med.speed,
+          heading: med.heading,
+          accepted: true,
+          reason: 'seed',
+          deltaMeters: 0,
+          dtSeconds: 0,
+          cumulativeDistanceMeters: distanceMeters,
+          units: units,
+          fare: fare,
+        ),
+      );
+
+      notifyListeners();
+      return;
+    }
+
+    final dt = max(0.001, now.difference(last.time).inMilliseconds / 1000.0);
+
+    final d = Geolocator.distanceBetween(
+      last.lat,
+      last.lng,
+      used.latitude,
+      used.longitude,
+    );
+
+    // min move (dinámico por speed/accuracy)
+    final minMove = max(_minMoveBaseMeters, med.accuracy * 0.20);
+    if (d < minMove) {
+      _pushSample(
+        TripSample(
+          time: now,
+          elapsedMs: elapsedMs,
+          raw: raw,
+          filtered: filtered,
+          used: used,
+          snapped: _snappedLast,
+          distToRouteMeters: _distanceToPlannedRouteMeters,
+          accuracy: med.accuracy,
+          speed: med.speed,
+          heading: med.heading,
+          accepted: false,
+          reason: 'min_move',
+          deltaMeters: d,
+          dtSeconds: dt,
+          cumulativeDistanceMeters: distanceMeters,
+          units: units,
+          fare: fare,
+        ),
+      );
+      notifyListeners();
+      return;
+    }
+
+    // max jump (por velocidad)
+    final maxBySpeed = (_maxSpeedMps * _maxSpeedMargin) * dt;
+    final maxJump = (_absoluteMaxJumpMeters > 0) ? min(maxBySpeed, _absoluteMaxJumpMeters) : maxBySpeed;
+
+    if (d > maxJump && d > 25) {
+      _pushSample(
+        TripSample(
+          time: now,
+          elapsedMs: elapsedMs,
+          raw: raw,
+          filtered: filtered,
+          used: used,
+          snapped: _snappedLast,
+          distToRouteMeters: _distanceToPlannedRouteMeters,
+          accuracy: med.accuracy,
+          speed: med.speed,
+          heading: med.heading,
+          accepted: false,
+          reason: 'max_jump',
+          deltaMeters: d,
+          dtSeconds: dt,
+          cumulativeDistanceMeters: distanceMeters,
+          units: units,
+          fare: fare,
+        ),
+      );
+      notifyListeners();
+      return;
+    }
+
+    // Accept
+    distanceMeters += d;
+
+    _lastAccepted = _GpsSample(
+      lat: used.latitude,
+      lng: used.longitude,
+      accuracy: med.accuracy,
+      speed: med.speed,
+      heading: med.heading,
+      time: now,
+    );
+
+    traveledPath.add(used);
+
+    _pushSample(
+      TripSample(
+        time: now,
+        elapsedMs: elapsedMs,
+        raw: raw,
+        filtered: filtered,
+        used: used,
+        snapped: _snappedLast,
+        distToRouteMeters: _distanceToPlannedRouteMeters,
+        accuracy: med.accuracy,
+        speed: med.speed,
+        heading: med.heading,
+        accepted: true,
+        reason: 'accepted',
+        deltaMeters: d,
+        dtSeconds: dt,
+        cumulativeDistanceMeters: distanceMeters,
+        units: units,
+        fare: fare,
+      ),
+    );
+
+    notifyListeners();
+  }
+
+  // ------------------------
+  // Snap helpers
+  // ------------------------
+
+  LatLng _maybeSnap(LatLng p, DateTime now) {
+    if (!snapToPlannedRoute || _plannedRoute.length < 2) {
+      _distanceToPlannedRouteMeters = null;
+      _snappedLast = false;
+      return p;
+    }
+
+    final snapped = _snapToPlannedRoute(p);
+    return snapped;
+  }
+
+  LatLng _snapToPlannedRoute(LatLng p) {
+    // Equirectangular projection para ciudad
+    const double R = 6371000.0;
+    final double lat0 = p.latitude * (pi / 180.0);
+    final double cosLat = cos(lat0);
+
+    Offset _toXY(LatLng ll) {
+      final x = (ll.longitude * (pi / 180.0)) * R * cosLat;
+      final y = (ll.latitude * (pi / 180.0)) * R;
+      return Offset(x, y);
+    }
+
+    LatLng _xyToLatLng(Offset xy) {
+      final lat = (xy.dy / R) * (180.0 / pi);
+      final lng = (xy.dx / (R * cosLat)) * (180.0 / pi);
+      return LatLng(lat, lng);
+    }
+
+    final pxy = _toXY(p);
+
+    // Ventana de búsqueda (evita saltos lejanos)
+    final int n = _plannedRoute.length;
     int start = 0;
     int end = n - 2;
+
     if (_routeCursor >= 0) {
       start = max(0, _routeCursor - 30);
       end = min(n - 2, _routeCursor + 80);
@@ -249,289 +561,136 @@ class TaximeterController extends ChangeNotifier {
 
     double bestDist = double.infinity;
     Offset bestXY = Offset.zero;
-    int bestIdx = start;
+    int bestSeg = _routeCursor >= 0 ? _routeCursor : 0;
 
     for (int i = start; i <= end; i++) {
       final a = _plannedRoute[i];
       final b = _plannedRoute[i + 1];
 
-      final axy = _toXY(a, p, cosLat);
-      final bxy = _toXY(b, p, cosLat);
+      final ax = _toXY(a);
+      final bx = _toXY(b);
 
-      final vx = bxy.dx - axy.dx;
-      final vy = bxy.dy - axy.dy;
-      final denom = vx * vx + vy * vy;
-      if (denom < 1e-6) continue;
+      final ab = bx - ax;
+      final ap = pxy - ax;
 
-      final t = (-axy.dx * vx - axy.dy * vy) / denom;
-      final tc = t.clamp(0.0, 1.0);
+      final abLen2 = ab.dx * ab.dx + ab.dy * ab.dy;
+      if (abLen2 == 0) continue;
 
-      final cx = axy.dx + tc * vx;
-      final cy = axy.dy + tc * vy;
+      double t = (ap.dx * ab.dx + ap.dy * ab.dy) / abLen2;
+      if (t < 0) t = 0;
+      if (t > 1) t = 1;
 
-      final dist = sqrt(cx * cx + cy * cy);
-      if (dist < bestDist) {
-        bestDist = dist;
+      final cx = ax.dx + ab.dx * t;
+      final cy = ax.dy + ab.dy * t;
+
+      final dx = pxy.dx - cx;
+      final dy = pxy.dy - cy;
+
+      final d = sqrt(dx * dx + dy * dy);
+      if (d < bestDist) {
+        bestDist = d;
         bestXY = Offset(cx, cy);
-        bestIdx = i;
+        bestSeg = i;
       }
     }
 
-    final snapped = _xyToLatLng(bestXY, p, cosLat);
-    return _ClosestOnRoute(snapped, bestDist, bestIdx);
+    _routeCursor = bestSeg;
+    _distanceToPlannedRouteMeters = bestDist;
+
+    // decide si realmente “snap”
+    // umbral dinámico: si accuracy es grande, no forzar snap tan agresivo
+    final lastAcc = (_window.isNotEmpty ? _window.last.accuracy : 25.0);
+    final threshold = max(18.0, lastAcc * 2.2);
+
+    if (bestDist <= threshold) {
+      _snappedLast = true;
+      return _xyToLatLng(bestXY);
+    } else {
+      _snappedLast = false;
+      return p;
+    }
   }
 
   List<LatLng> _downsampleRoute(List<LatLng> pts, {required int maxPoints}) {
     if (pts.length <= maxPoints) return pts;
-    final step = (pts.length / maxPoints).ceil();
+    if (maxPoints < 2) return [pts.first, pts.last];
+
     final out = <LatLng>[];
-    for (int i = 0; i < pts.length; i += step) {
-      out.add(pts[i]);
+    final step = (pts.length - 1) / (maxPoints - 1);
+
+    for (int i = 0; i < maxPoints; i++) {
+      final idx = (i * step).round().clamp(0, pts.length - 1);
+      out.add(pts[idx]);
     }
-    if (out.isEmpty || out.last != pts.last) out.add(pts.last);
     return out;
   }
 
   // ------------------------
-  // GPS start/stop
+  // Export JSON builder
   // ------------------------
 
-  Future<void> start() async {
-    if (running) return;
-
-    final serviceEnabled = await Geolocator.isLocationServiceEnabled();
-    if (!serviceEnabled) {
-      throw Exception('Ubicación desactivada (GPS). Actívala e intenta de nuevo.');
-    }
-
-    var perm = await Geolocator.checkPermission();
-    if (perm == LocationPermission.denied) perm = await Geolocator.requestPermission();
-    if (perm == LocationPermission.denied || perm == LocationPermission.deniedForever) {
-      throw Exception('Permiso de ubicación no concedido.');
-    }
-
-    running = true;
-
-    distanceMeters = 0;
-    traveledPath.clear();
-    _window.clear();
-    _lastAccepted = null;
-    _rawLatLng = null;
-    _distanceToPlannedRouteMeters = null;
-    _snappedLast = false;
-
-    _routeCursor = (_plannedRoute.length >= 2) ? 0 : -1;
-
-    _stopwatch
-      ..reset()
-      ..start();
-    _startTicker();
-
-    try {
-      final last = await Geolocator.getLastKnownPosition();
-      if (last != null) _seedFromPosition(last);
-    } catch (_) {}
-
-    await _startLocationStream(distanceFilter: 0);
-
-    _switchToNormalFilterTimer?.cancel();
-    _switchToNormalFilterTimer = Timer(const Duration(seconds: 12), () async {
-      if (!running) return;
-      await _startLocationStream(distanceFilter: 5);
-    });
-
-    Geolocator.getCurrentPosition(
-      desiredAccuracy: LocationAccuracy.high,
-      timeLimit: const Duration(seconds: 3),
-    ).then((pos) {
-      if (!running) return;
-      _ingestPosition(pos);
-    }).catchError((_) {});
-
-    notifyListeners();
-  }
-
-  Future<void> _startLocationStream({required int distanceFilter}) async {
-    await _sub?.cancel();
-    const base = LocationSettings(accuracy: LocationAccuracy.high);
-
-    final settings = LocationSettings(
-      accuracy: base.accuracy,
-      distanceFilter: distanceFilter,
-    );
-
-    _sub = Geolocator.getPositionStream(locationSettings: settings).listen(
-          (pos) => _ingestPosition(pos),
-      onError: (_) {},
-    );
-  }
-
-  void _seedFromPosition(Position pos) {
-    final now = pos.timestamp ?? DateTime.now();
-    currentPosition = pos;
-
-    final double acc = (pos.accuracy.isFinite ? pos.accuracy : 999.0);
-    if (acc <= (_maxAccuracyMeters * 2)) {
-      traveledPath.add(LatLng(pos.latitude, pos.longitude));
-      _lastAccepted = _GpsSample(
-        lat: pos.latitude,
-        lng: pos.longitude,
-        accuracy: acc,
-        speed: pos.speed.isFinite ? pos.speed : 0.0,
-        heading: pos.heading.isFinite ? pos.heading : 0.0,
-        time: now,
-      );
-    }
-    notifyListeners();
-  }
-
-  void _addTraveledPointForUi(LatLng ll) {
-    if (traveledPath.isEmpty) {
-      traveledPath.add(ll);
-      return;
-    }
-
-    final last = traveledPath.last;
-    final dUi = Geolocator.distanceBetween(
-      last.latitude,
-      last.longitude,
-      ll.latitude,
-      ll.longitude,
-    );
-
-    if (dUi >= _uiMinSegmentMeters) {
-      traveledPath.add(ll);
-
-      // cap opcional (evita listas gigantes)
-      if (traveledPath.length > _uiMaxPoints) {
-        traveledPath.removeRange(0, traveledPath.length - _uiMaxPoints);
+  Map<String, dynamic> buildTripExport({
+    LatLng? origin,
+    LatLng? destination,
+    String? originLabel,
+    String? destinationLabel,
+    List<LatLng>? plannedRoute,
+  }) {
+    List<Map<String, double>> packLine(List<LatLng> pts, {int? max}) {
+      if (max != null && pts.length > max) {
+        final down = _downsampleRoute(List<LatLng>.from(pts), maxPoints: max);
+        return down.map((p) => {'lat': p.latitude, 'lng': p.longitude}).toList();
       }
-    }
-  }
-
-  void _ingestPosition(Position pos) {
-    if (!running) return;
-
-    final double acc = (pos.accuracy.isFinite ? pos.accuracy : 999.0);
-    if (acc > _maxAccuracyMeters) return;
-
-    final now = pos.timestamp ?? DateTime.now();
-
-    final raw = _GpsSample(
-      lat: pos.latitude,
-      lng: pos.longitude,
-      accuracy: acc,
-      speed: pos.speed.isFinite ? pos.speed : 0.0,
-      heading: pos.heading.isFinite ? pos.heading : 0.0,
-      time: now,
-    );
-
-    _window.add(raw);
-    if (_window.length > _medianWindowSize) _window.removeAt(0);
-    final filtered = (_window.length >= 3) ? _medianSample(_window) : raw;
-
-    final pFiltered = LatLng(filtered.lat, filtered.lng);
-    _rawLatLng = pFiltered;
-
-    final cand = _closestPointOnPlannedRoute(pFiltered);
-    _distanceToPlannedRouteMeters = cand?.distMeters;
-
-    final radius = _snapRadiusMeters(filtered.accuracy);
-    final bool canSnap = snapToPlannedRoute && cand != null && cand.distMeters <= radius;
-
-    final useLatLng = canSnap ? cand.point : pFiltered;
-    _snappedLast = canSnap;
-    if (canSnap) _routeCursor = cand.segIndex;
-
-    currentPosition = Position(
-      latitude: useLatLng.latitude,
-      longitude: useLatLng.longitude,
-      timestamp: filtered.time,
-      accuracy: filtered.accuracy,
-      altitude: pos.altitude,
-      heading: filtered.heading,
-      speed: filtered.speed,
-      speedAccuracy: pos.speedAccuracy,
-      floor: pos.floor,
-      isMocked: pos.isMocked,
-      altitudeAccuracy: pos.altitudeAccuracy,
-      headingAccuracy: pos.headingAccuracy,
-    );
-
-    final last = _lastAccepted;
-
-    if (last == null) {
-      _addTraveledPointForUi(useLatLng);
-      _lastAccepted = _GpsSample(
-        lat: useLatLng.latitude,
-        lng: useLatLng.longitude,
-        accuracy: filtered.accuracy,
-        speed: filtered.speed,
-        heading: filtered.heading,
-        time: filtered.time,
-      );
-      notifyListeners();
-      return;
+      return pts.map((p) => {'lat': p.latitude, 'lng': p.longitude}).toList();
     }
 
-    final dt = filtered.time.difference(last.time);
-    final dtSafe = dt.isNegative ? const Duration(seconds: 1) : dt;
-
-    final d = Geolocator.distanceBetween(
-      last.lat,
-      last.lng,
-      useLatLng.latitude,
-      useLatLng.longitude,
-    );
-
-    final minMove = _minMoveThresholdMeters(filtered.accuracy);
-    if (d < minMove) {
-      return;
-    }
-
-    final maxJump = _maxAllowedJumpMeters(dtSafe);
-    if (d > maxJump) {
-      return;
-    }
-
-    distanceMeters += d;
-
-    // UI: agrega menos puntos para que la polyline no se vuelva “pesada”
-    _addTraveledPointForUi(useLatLng);
-
-    _lastAccepted = _GpsSample(
-      lat: useLatLng.latitude,
-      lng: useLatLng.longitude,
-      accuracy: filtered.accuracy,
-      speed: filtered.speed,
-      heading: filtered.heading,
-      time: filtered.time,
-    );
-
-    notifyListeners();
+    return {
+      'exported_at': DateTime.now().toIso8601String(),
+      'shift': shift.name,
+      'channel': channel.name,
+      'trip': {
+        'started_at': tripStartedAt?.toIso8601String(),
+        'ended_at': tripEndedAt?.toIso8601String(),
+        'elapsed_ms': elapsed.inMilliseconds,
+        'distance_m': distanceMeters,
+        'units': units,
+        'fare': fare,
+      },
+      'origin': origin == null
+          ? null
+          : {
+        'lat': origin.latitude,
+        'lng': origin.longitude,
+        'label': originLabel ?? '',
+      },
+      'destination': destination == null
+          ? null
+          : {
+        'lat': destination.latitude,
+        'lng': destination.longitude,
+        'label': destinationLabel ?? '',
+      },
+      'planned_route': plannedRoute == null ? null : packLine(plannedRoute, max: 1500),
+      'traveled_path': packLine(traveledPath),
+      'samples': _samples.map((s) => s.toJson()).toList(),
+    };
   }
+}
 
-  Future<void> stop() async {
-    if (!running) return;
+class _GpsSample {
+  final double lat;
+  final double lng;
+  final double accuracy;
+  final double speed;
+  final double heading;
+  final DateTime time;
 
-    running = false;
-    _stopwatch.stop();
-    _stopTicker();
-
-    _switchToNormalFilterTimer?.cancel();
-    _switchToNormalFilterTimer = null;
-
-    await _sub?.cancel();
-    _sub = null;
-
-    notifyListeners();
-  }
-
-  @override
-  void dispose() {
-    _stopTicker();
-    _switchToNormalFilterTimer?.cancel();
-    _sub?.cancel();
-    super.dispose();
-  }
+  const _GpsSample({
+    required this.lat,
+    required this.lng,
+    required this.accuracy,
+    required this.speed,
+    required this.heading,
+    required this.time,
+  });
 }
